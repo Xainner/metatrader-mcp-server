@@ -4,6 +4,10 @@ Fork de trabajo: https://github.com/Xainner/metatrader-mcp-server
 
 Este fork se mantiene para corregir los problemas detectados en la revisión antes de habilitar operaciones automáticas. La segunda entrega (versión 0.6.0) implementa los arreglos; la validación en una cuenta demo sigue pendiente.
 
+## Plan de mejoras de ejecución, rendimiento y verificación
+
+Las ocho mejoras propuestas después del PR #2 están documentadas en [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md), con prioridades, entregas, herramientas propuestas y criterios de aceptación. Su implementación queda pendiente; este documento no habilita operaciones ni cambia límites de riesgo.
+
 ## Pendientes conocidos tras fusionar el PR #1
 
 La revisión de la versión 0.6.0 reprodujo tres problemas adicionales, resueltos en el commit `cd2001c`. Se detallan con ubicaciones, pasos de reproducción simulada, impacto y criterios de aceptación en [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
