@@ -10,6 +10,8 @@ Las ocho mejoras propuestas después del PR #2 están documentadas en [docs/IMPR
 
 El [estudio completo de automatización](docs/AUTOMATION_IMPLEMENTATION_STUDY.md) desarrolla recepción de señales, integración con Rinari Agency y un centro de operaciones de dos a ocho agentes. El [anexo de contratos](docs/SIGNAL_TOOL_CONTRACTS.md) define las herramientas y permisos propuestos.
 
+Primera pieza disponible: [Signal Hub 0.1](services/signal-hub/README.md), receptor Telegram Bot API independiente para Linux, con historial persistente y MCP de lectura. Opera únicamente en observación: no valida señales financieras, no envía órdenes y no implementa todavía el catálogo completo del estudio.
+
 ## Pendientes conocidos tras fusionar el PR #1
 
 La revisión de la versión 0.6.0 reprodujo tres problemas adicionales, resueltos en el commit `cd2001c`. Se detallan con ubicaciones, pasos de reproducción simulada, impacto y criterios de aceptación en [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).

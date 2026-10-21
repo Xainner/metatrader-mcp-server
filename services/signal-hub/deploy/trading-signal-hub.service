@@ -1,0 +1,21 @@
+[Unit]
+Description=Trading signal hub - observe-only Telegram receiver
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading/signal-hub
+Environment=TRADING_SIGNAL_HOME=%h/trading/signal-hub
+ExecStart=%h/trading/signal-hub/.venv/bin/python -m trading_signal_hub poll
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=15
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

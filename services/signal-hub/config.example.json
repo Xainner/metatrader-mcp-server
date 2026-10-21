@@ -1,0 +1,6 @@
+{
+  "source_id": "telegram-main",
+  "enabled": false,
+  "allowed_chat_ids": [],
+  "poll_timeout_seconds": 25
+}
