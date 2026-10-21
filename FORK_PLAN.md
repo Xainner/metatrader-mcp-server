@@ -6,13 +6,13 @@ Este fork se mantiene para corregir los problemas detectados en la revisión ant
 
 ## Pendientes conocidos tras fusionar el PR #1
 
-La revisión de la versión 0.6.0 reprodujo tres problemas adicionales. Se detallan con ubicaciones, pasos de reproducción simulada, impacto y criterios de aceptación en [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
+La revisión de la versión 0.6.0 reprodujo tres problemas adicionales, resueltos en el commit `cd2001c`. Se detallan con ubicaciones, pasos de reproducción simulada, impacto y criterios de aceptación en [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
-- [ ] **P1 / MT5-001:** rechazar aperturas si no se puede leer el estado necesario para comprobar exposición o pérdida diaria.
-- [ ] **P1 / MT5-002:** informar un cierre como no verificado si falla la consulta posterior de la posición.
-- [ ] **P2 / MT5-003:** reservar de forma atómica las solicitudes en curso y su exposición para clientes concurrentes.
+- [x] **P1 / MT5-001:** rechazar aperturas si no se puede leer el estado necesario para comprobar exposición o pérdida diaria.
+- [x] **P1 / MT5-002:** informar un cierre como no verificado si falla la consulta posterior de la posición.
+- [x] **P2 / MT5-003:** reservar de forma atómica las solicitudes en curso y su exposición para clientes concurrentes.
 
-Las casillas completadas del plan original describen la implementación base y sus pruebas existentes. Estos casos adicionales siguen abiertos y requieren sus propias pruebas de regresión. El soporte SL/TP al abrir y la conservación de niveles al modificar pendientes sí están implementados en 0.6.0.
+Las casillas completadas del plan original describen la implementación base y sus pruebas existentes. Estos casos tienen sus propias pruebas de regresión en `tests/unit/test_known_issues.py`; como el resto, siguen pendientes de validación en una cuenta demo. El soporte SL/TP al abrir y la conservación de niveles al modificar pendientes sí están implementados en 0.6.0.
 
 ## Arreglos pendientes
 

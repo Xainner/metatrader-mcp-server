@@ -29,7 +29,8 @@ def run_bulk(
     Returns:
         dict: ``error`` is True when any item failed or is still present. ``data``
         contains ``results`` (one entry per ticket), ``succeeded``, ``failed``,
-        ``remaining`` and ``total``.
+        ``unverified`` (final state unknown), ``remaining`` (None if the final
+        listing failed) and ``total``.
     """
     if items is None:
         return {"error": True, "message": f"Cannot read {noun} from the terminal: {error()}", "data": None}
@@ -46,6 +47,7 @@ def run_bulk(
             "message": response.get("message"),
             "status": response.get("status"),
             "retcode": response.get("retcode"),
+            "verification": response.get("verification"),
         })
 
     present = list_present()
@@ -56,8 +58,14 @@ def run_bulk(
         if item["id"] in still_present and not item["error"]:
             item["error"] = True
             item["message"] = f"{item['message']}; still present after the request"
+        elif verified and item["id"] not in still_present and item["verification"] == "unknown":
+            # The final listing is valid and no longer contains the ticket: the close is confirmed.
+            item["error"] = False
+            item["verification"] = "confirmed"
+            item["message"] = f"{item['message']}; confirmed closed by the final listing"
 
     failed = [r["id"] for r in results if r["error"]]
+    unverified = [r["id"] for r in results if r["error"] and r["verification"] == "unknown"]
     succeeded = [r["id"] for r in results if not r["error"]]
     has_error = bool(failed or remaining) or (bool(targets) and not verified)
 
@@ -65,6 +73,8 @@ def run_bulk(
         message = f"No {noun} to process"
     elif has_error:
         message = f"{verb} {len(succeeded)} of {len(targets)} {noun}; failed: {failed}; still present: {remaining}"
+        if unverified:
+            message += f"; final state unknown for {unverified}, check before retrying"
         if not verified:
             message += f"; could not verify the remaining {noun}: {error()}"
     else:
@@ -77,6 +87,7 @@ def run_bulk(
             "total": len(targets),
             "succeeded": succeeded,
             "failed": failed,
+            "unverified": unverified,
             "remaining": remaining if verified else None,
             "results": results,
         },

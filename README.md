@@ -609,7 +609,11 @@ Trading results include `status` and `retcode`. Only `error: false` means the re
 | `rejected` | Rejected locally or by the trade server; see `retcode` and `message` |
 | `no_response` | The terminal did not answer: check positions and orders before retrying |
 
-Bulk operations (`close_all_*`, `cancel_all_*`) return the result of every item and the tickets still present afterwards.
+Closing a position also returns `verification`: `confirmed` only when a valid query no longer lists the position, `remaining` (with `remaining_volume`), `unknown` (the final state could not be read: check positions before retrying) or `not_closed`.
+
+Bulk operations (`close_all_*`, `cancel_all_*`) return the result of every item, the tickets whose final state is unknown (`unverified`) and the tickets still present afterwards.
+
+If a configured limit needs terminal data that cannot be read, new orders are blocked. Risk checks and the order request run atomically per connection, and sent orders stay reserved (including the working remainder of a RETURN partial fill) until the listings show their full volume; this does not coordinate several processes or connections on the same account.
 
 ### Custom Port and Host (HTTP API)
 

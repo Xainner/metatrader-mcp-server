@@ -17,7 +17,7 @@ from ..types import (
 	OrderFilling,
 	OrderTime
 )
-from ._result import interpret_order_result, failure, STATUS_NO_RESPONSE, SUCCESS_STATUSES
+from ._result import interpret_order_result, failure
 from ._validation import (
 	is_buy,
 	select_filling_mode,
@@ -80,14 +80,28 @@ def _normalize_levels(symbol_info, stop_loss, take_profit):
 	return levels[0], levels[1], None
 
 
-def _send(request: Dict, guard=None, duplicate_key=None) -> Dict:
-	"""Send a request and interpret its result, remembering it for duplicate detection."""
-	response = interpret_order_result(mt5, mt5.order_send(request), request)
-	if guard is not None and duplicate_key is not None:
-		# A request with an unknown outcome is remembered too: retrying it blindly could open twice.
-		if response["status"] in SUCCESS_STATUSES or response["status"] == STATUS_NO_RESPONSE:
-			guard.record(duplicate_key)
-	return response
+def _send(request: Dict) -> Dict:
+	"""Send a request and interpret its result."""
+	return interpret_order_result(mt5, mt5.order_send(request), request)
+
+
+def _send_opening(guard, request: Dict, *, symbol: str, side: int, stop_loss, duplicate_key) -> Dict:
+	"""
+	Check the risk limits, send an order that opens exposure and reserve it, atomically.
+
+	The guard lock is held from the first check until the reservation is stored,
+	so concurrent requests on the same connection cannot pass the checks with
+	the same budget or the same duplicate key.
+	"""
+	with guard.opening():
+		error = guard.check_duplicate(duplicate_key) or guard.check_new_order(
+			mt5, symbol=symbol, side=side, volume=request["volume"], entry_price=request["price"], stop_loss=stop_loss
+		)
+		if error:
+			return failure(error)
+		response = _send(request)
+		guard.after_send(response, duplicate_key, request["volume"])
+		return response
 
 
 def send_order(
@@ -227,14 +241,8 @@ def send_order(
 			request["position"] = int(position)
 			return _send(request)
 
-		error = guard.check_new_order(mt5, symbol=symbol, side=order_type, volume=volume, entry_price=price, stop_loss=stop_loss)
-		if error:
-			return failure(error)
 		duplicate_key = ("DEAL", symbol, order_type, volume, stop_loss, take_profit)
-		error = guard.check_duplicate(duplicate_key)
-		if error:
-			return failure(error)
-		return _send(request, guard, duplicate_key)
+		return _send_opening(guard, request, symbol=symbol, side=order_type, stop_loss=stop_loss, duplicate_key=duplicate_key)
 
 	# ----------------------------------------------------------
 	# Pending order (BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP)
@@ -292,14 +300,8 @@ def send_order(
 			request["expiration"] = expiration
 
 		side = OrderType.BUY.value if is_buy(order_type) else OrderType.SELL.value
-		error = guard.check_new_order(mt5, symbol=symbol, side=side, volume=volume, entry_price=price, stop_loss=stop_loss)
-		if error:
-			return failure(error)
 		duplicate_key = ("PENDING", symbol, order_type, volume, price, stop_loss, take_profit)
-		error = guard.check_duplicate(duplicate_key)
-		if error:
-			return failure(error)
-		return _send(request, guard, duplicate_key)
+		return _send_opening(guard, request, symbol=symbol, side=side, stop_loss=stop_loss, duplicate_key=duplicate_key)
 
 	# -----------------------
 	# Modify position (SL/TP)
