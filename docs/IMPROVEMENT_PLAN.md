@@ -6,6 +6,8 @@ Base del plan: versión 0.6.0 con PR #2 fusionado, commit `6b5867aa5a66904f9c4b9
 
 **Estado: propuesto; implementación pendiente.** Este plan documenta las ocho mejoras acordadas para ejecución, velocidad y confianza operativa. Los nombres nuevos de herramientas y los campos descritos son propuestas de contrato, no capacidades disponibles todavía.
 
+Desarrollo completo del plan: [estudio de automatización, señales y centro de operaciones con Rinari Agency](AUTOMATION_IMPLEMENTATION_STUDY.md), con diseño inicial de dos agentes y ampliación a ocho. El [anexo de contratos](SIGNAL_TOOL_CONTRACTS.md) detalla herramientas, permisos y ejemplos propuestos.
+
 El objetivo es reducir llamadas innecesarias, verificar los resultados contra MT5 y mantener un comportamiento definido ante errores. La rentabilidad de una estrategia requiere evaluación independiente; una mejora de infraestructura no demuestra una ventaja de mercado.
 
 ## Prioridades y entregas

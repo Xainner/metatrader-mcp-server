@@ -8,6 +8,8 @@ Este fork se mantiene para corregir los problemas detectados en la revisión ant
 
 Las ocho mejoras propuestas después del PR #2 están documentadas en [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md), con prioridades, entregas, herramientas propuestas y criterios de aceptación. Su implementación queda pendiente; este documento no habilita operaciones ni cambia límites de riesgo.
 
+El [estudio completo de automatización](docs/AUTOMATION_IMPLEMENTATION_STUDY.md) desarrolla recepción de señales, integración con Rinari Agency y un centro de operaciones de dos a ocho agentes. El [anexo de contratos](docs/SIGNAL_TOOL_CONTRACTS.md) define las herramientas y permisos propuestos.
+
 ## Pendientes conocidos tras fusionar el PR #1
 
 La revisión de la versión 0.6.0 reprodujo tres problemas adicionales, resueltos en el commit `cd2001c`. Se detallan con ubicaciones, pasos de reproducción simulada, impacto y criterios de aceptación en [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
