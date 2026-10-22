@@ -1,0 +1,22 @@
+[Unit]
+Description=Forward detected trading signals to owner Discord webhook
+After=network-online.target gold-research.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading/discord-relay
+ExecStart=%h/trading/gold-research/.venv/bin/python -m gold_research.discord_forwarder run
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/trading/discord-relay
+MemoryMax=192M
+CPUQuota=20%
+
+[Install]
+WantedBy=default.target

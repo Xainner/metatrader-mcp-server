@@ -62,7 +62,17 @@ def status(config, inbox):
                 receivers.append({**receiver, 'heartbeat_stale': age > 30 or age < -5})
             except (OSError, ValueError, KeyError):
                 receivers.append({'source_id': source['source_id'], 'state': 'unavailable', 'heartbeat_stale': True})
+    notifications = {}
+    if config.get('discord_status_file'):
+        try:
+            relay = json.loads(Path(config['discord_status_file']).read_text())
+            age = (datetime.now(timezone.utc)-datetime.fromisoformat(relay['as_of'])).total_seconds()
+            notifications['discord'] = {key: relay.get(key) for key in ('state', 'deliveries', 'last_delivery_change', 'as_of')}
+            notifications['discord']['heartbeat_stale'] = age > 30 or age < -5
+        except (OSError, ValueError, KeyError):
+            notifications['discord'] = {'state': 'unavailable', 'heartbeat_stale': True}
     return {'mode': 'research_only', 'forex_gold_execution': False, 'telegram_sender': False,
+            'notifications': notifications,
             'receivers': receivers,
             'execution_route': 'metatrader-demo in Windows', 'source_id': config['source_id'],
             'sources': [s['source_id'] for s in config.get('sources', [{'source_id': config['source_id']}])],
