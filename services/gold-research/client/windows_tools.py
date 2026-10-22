@@ -10,6 +10,16 @@ import subprocess
 import time
 
 
+def analyze_market_context(context):
+    """Analyze an already captured context over SSH, without holding the MT5 worker."""
+    result = subprocess.run(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'server2',
+                             '/home/xainner/trading/gold-research/.venv/bin/python', '-m', 'gold_research', 'analyze'],
+                            input=json.dumps(context, allow_nan=False), capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise RuntimeError('Remote research unavailable; no broker action was requested')
+    return json.loads(result.stdout)
+
+
 def register(mcp, mt5, lock, ensure_demo):
     from mcp.types import ToolAnnotations
     from metatrader_client.order._validation import select_filling_mode, validate_volume, check_stops, normalize_price
@@ -86,12 +96,7 @@ def register(mcp, mt5, lock, ensure_demo):
         """Capture MT5 data and compute forex-gold analysis/candidates on owner-authorized server2."""
         context = get_market_context(count=count)
         # SSH executes outside the MT5 lock: network analysis must not hold up a close tool.
-        result = subprocess.run(['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', 'server2',
-                                 '/home/xainner/trading/gold-research/.venv/bin/python', '-m', 'gold_research', 'analyze'],
-                                input=json.dumps(context, allow_nan=False), capture_output=True, text=True, timeout=15)
-        if result.returncode:
-            raise RuntimeError('Remote research unavailable; no broker action was requested')
-        return json.loads(result.stdout)
+        return analyze_market_context(context)
 
     @mcp.tool(annotations=read)
     def calculate_trade_risk(direction: str, stop_loss: float, risk_usd: float | None = None, volume: float | None = None) -> dict:
