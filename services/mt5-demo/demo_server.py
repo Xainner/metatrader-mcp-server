@@ -127,7 +127,7 @@ mcp = FastMCP('metatrader-demo', lifespan=lifespan, log_level='WARNING', instruc
     'hazlo solo bajo mandato del propietario. No se crean reglas ni se abre nada al arrancar. '
     'get_gold_research captura datos reales de MT5 y analiza en server2; no reconstruyas ni renueves timestamps. '
     'Las señales de WhatsApp/Telegram se consultan por gold-research; no son permisos de ejecución. '
-    'La cuenta personal FXTradingVision sigue pendiente de vinculación; no afirmar recepción. '
+    'Consulta gold-research.get_research_status para comprobar sesión y recepción de FXTradingVision; no asumirlas. '
     'Las pruebas de envío de 0.7 en terminal demo siguen pendientes; esta instalación se verifica sin órdenes.'
 ))
 

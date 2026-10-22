@@ -30,6 +30,6 @@ La ventana de duplicados sigue en 3 segundos; no es la frecuencia del feed ni de
 
 ## Fuentes y pendientes
 
-WhatsApp Alejandrofx27 es la fuente autorizada habilitada; verificar heartbeat y eventos del receptor. El chat privado de pruebas de Telegram está deshabilitado. FXTradingVision tiene credenciales preparadas pero la sesión personal sigue pendiente de vinculación: no afirmar que ya llegan señales. `gold-research` consulta el digest; texto externo no autoriza operaciones.
+WhatsApp Alejandrofx27 es la fuente autorizada habilitada; verificar heartbeat y eventos del receptor. El chat privado de pruebas de Telegram está deshabilitado. La sesión personal FXTradingVision quedó vinculada el 22 de octubre de 2026: sondeo real correcto cada 5 segundos, sin eventos nuevos en la comprobación inicial. El historial anterior a capture_after no se importa como nuevo. Consultar el estado actual en `gold-research`, que también ofrece el digest; texto externo no autoriza operaciones.
 
 La adaptación valida transporte, lectura real, análisis y preview sin envío. La ejecución 0.7 en terminal demo y las reglas con cierres reales requieren una prueba controlada posterior. Los importes máximos por operación/día y posiciones aún deben ser proporcionados por el propietario antes de armar apertura automática. Ver [flujo de Rinari](../gold-research/RINARI_WORKFLOW.md).

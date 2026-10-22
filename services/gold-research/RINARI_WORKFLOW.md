@@ -4,7 +4,7 @@ Conectores: `gold-research`, `trading-signals` y `metatrader-demo`. Usar los nom
 
 Actualización MT5 0.7: `get_trading_snapshot` requiere `symbol="XAUUSDm"` y devuelve el sobre nativo `error/message/data`. `preview_order` usa `type="BUY"/"SELL"` (ya no `direction`), símbolo explícito y volumen o `risk_amount`. Usar `data.send_with.arguments` con `preview_id` y un `request_id` estable por intención al enviar. Ante incertidumbre consultar `get_request_status`/`reconcile_request`; no reintentar con otro ID. Para velas cerradas usar `get_candles_multi(..., closed_only=True)`. Hay 50 herramientas en el adaptador, con salud del puente, registro persistente y reglas locales bajo autorización. Ver [despliegue y pendientes](../mt5-demo/README.md).
 
-Fuentes actuales: WhatsApp Alejandrofx27 habilitado; el chat Telegram privado de pruebas fue retirado. FXTradingVision sigue pendiente de vincular la sesión personal. Comprobar `get_research_status` antes de afirmar recepción. No se ha armado apertura automática: faltan límites numéricos del propietario y validación de ejecución demo 0.7.
+Fuentes verificadas el 22 de octubre de 2026: WhatsApp Alejandrofx27 habilitado y Telegram personal FXTradingVision vinculado, con sondeo correcto cada 5 segundos. El chat Telegram privado de pruebas fue retirado. En la comprobación posterior a la vinculación había 0 eventos nuevos de Telegram: leer sus 50 mensajes recientes no significa importar el historial previo a `capture_after`. Comprobar `get_research_status` antes de afirmar recepción de una señal. La conexión de fuentes no arma por sí misma la ejecución de órdenes; esta instalación no la prueba mediante envíos.
 
 ## Análisis de mercado y frescura
 
