@@ -18,11 +18,13 @@ for (const name of ['SingletonLock','SingletonCookie','SingletonSocket']) {
 }
 const store = new Store(path.join(home, 'data/signals.sqlite3'), initial.source_id);
 let state = 'starting', qr = null, qrAt = 0, client = null, groups = [], channels = [], lastError = null, authenticated = false, mainReady = false;
+let channelPoll = {state:'not_checked', last_polled_at:null, messages_seen:0, last_message_at:null};
 const status = () => ({state:!authenticated && qr ? 'awaiting_qr' : state, source_id:initial.source_id, enabled:readConfig().enabled,
   authorized_groups:readConfig().allowed_group_ids.length, stored_events:store.count(),
   authorized_channels:(readConfig().allowed_newsletter_ids || []).length,
   qr_available:!!qr && Date.now()-qrAt < 45000, last_error:lastError,
   qr_version:qrAt, authenticated, receiver_ready:authenticated && mainReady,
+  channel_poll:channelPoll,
   execution_authorized:false, as_of:new Date().toISOString()});
 const fail = code => { lastError=code; console.error(code); };
 setInterval(() => {
@@ -100,6 +102,31 @@ try {
     catch { fail('GROUP_DISCOVERY_FAILED'); }
   };
   await refreshGroups(); setInterval(refreshGroups,60000);
+  let polling=false;
+  const pollChannels=async()=>{
+    if (polling || !authenticated || !mainReady) return;
+    const config=readConfig();
+    if (!config.enabled || !(config.allowed_newsletter_ids || []).length) return;
+    polling=true;
+    // A blocked browser RPC must not accumulate concurrent polling requests.
+    const timeout=setTimeout(()=>{fail('CHANNEL_POLL_TIMEOUT');process.exit(1);},20000);
+    try {
+      let seen=0, latest=0;
+      for (const id of config.allowed_newsletter_ids) {
+        const messages=await client.getMessages(id,{count:50});
+        for (const msg of messages) {
+          seen++; latest=Math.max(latest,Number(msg.timestamp || msg.t) || 0);
+          const old=store.known(id,wid(msg.id));
+          if (old && old.text===String(msg.body || msg.caption || '')) continue;
+          record({...msg,chatId:id},msg.type==='revoked' ? 'revoke' : old ? 'edit' : 'new');
+        }
+      }
+      channelPoll={state:'ok',last_polled_at:new Date().toISOString(),messages_seen:seen,
+        last_message_at:latest ? new Date(latest*1000).toISOString() : null};
+    } catch { channelPoll={...channelPoll,state:'failed',last_polled_at:new Date().toISOString()};fail('CHANNEL_POLL_FAILED'); }
+    finally {clearTimeout(timeout);polling=false;}
+  };
+  await pollChannels(); setInterval(pollChannels,5000);
   let missed=0;
   setInterval(async()=>{
     try {

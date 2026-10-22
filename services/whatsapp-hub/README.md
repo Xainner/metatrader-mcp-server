@@ -4,6 +4,8 @@ Receptor de solo lectura con `@wppconnect-team/wppconnect` **2.3.5**, Chromium y
 
 También admite **canales de WhatsApp** (`@newsletter`), con una lista permitida independiente `allowed_newsletter_ids`. La cuenta debe seguir ya el canal; el receptor no sigue canales ni se une a grupos. La pantalla muestra metadatos de grupos y canales, sin leer su historial. La selección por nombre debe resolverse a un ID exacto; un nombre homónimo requiere aclaración. Se escuchan eventos `onMessage` y `onAnyMessage` con deduplicación antes de guardar; solo pasa la fuente explícitamente habilitada. La recepción real de un canal debe validarse observando una publicación nueva: no se presupone por el estado conectado.
 
+Tras habilitar un canal, hay además sondeo de sus últimas 50 publicaciones cada 5 segundos, sin marcar vistos ni enviar mensajes. Se conservan únicamente mensajes posteriores a `capture_after`; los anteriores solo pasan por el filtro y no se importan como nuevas señales. El sondeo detecta cambios de texto en mensajes ya guardados. `channel_poll` informa éxito/error, fecha de consulta y cantidad observada sin exponer contenido. No garantiza recuperación completa de una interrupción o de ráfagas de más de 50 publicaciones; no se recorren páginas históricas ni se promete entrega exactamente una vez. Un RPC atascado más de 20 segundos reinicia el receptor, sin acumular consultas paralelas.
+
 ## Componentes
 
 - `src/server.mjs`: QR y estado por HTTP privado; escucha mensajes nuevos, ediciones y revocaciones. No ofrece funciones para enviar mensajes, unirse a grupos ni operar.
