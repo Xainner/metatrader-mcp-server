@@ -76,6 +76,16 @@ journalctl --user -u trading-signal-hub -n 30 --no-pager
 
 `configured=true` no significa conectado: comprobar `receiver_state`, `last_poll_at` y errores. El timeout de long polling es espera máxima cuando no hay novedades, no un intervalo fijo de 25 segundos por mensaje. El siguiente offset solo se envía después del commit durable. La Bot API no ofrece aquí un historial arbitrario ni una garantía general de eventos de borrado: no afirmar que se han capturado todos los mensajes anteriores. [Bot API: getUpdates](https://core.telegram.org/bots/api#getupdates).
 
+## Comprobar acceso a nuevas fuentes
+
+`python -m trading_signal_hub check-chats --chat-id=-1001234567890` comprueba identidad, tipo y membresía del propio bot mediante `getMe`, `getChat` y `getChatMember`. No consume `getUpdates`, no mueve el offset, no envía mensajes y no añade el bot a chats. Puede ejecutarse con el receptor activo. Una entrada en la lista permitida no prueba acceso.
+
+Usar IDs exactos de Bot API. Los IDs de canales/supergrupos llevan signo negativo; no añadir un segundo prefijo `100` si ya existe. Si el propietario aporta un número positivo con apariencia de ID de canal, su conversión a negativo sigue pendiente de confirmación por Telegram; un HTTP 400 puede indicar ID incorrecto o falta de acceso, no identifica por sí solo cuál de ellos.
+
+Para recibir publicaciones el bot debe tener acceso real al canal/grupo. En grupos, además necesita visibilidad de mensajes normales por permisos/privacidad; mensajes escritos por otros bots tienen limitaciones de recepción documentadas por Telegram. Si el propietario solo accede con su cuenta personal y no puede incorporar un bot, se requiere un receptor de sesión de usuario separado; este paquete no inicia ni suplanta esa sesión. [FAQ oficial](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get).
+
+Los textos en inglés pasan al parser/validador y digest del paquete hermano `gold-research`. Que el idioma esté soportado no garantiza que cualquier formato tenga entrada, SL y TP completos; consultar estados y revisiones y mantener separado el mandato de ejecución.
+
 ## Rinari: conector separado de lectura
 
 Fragmento MCP de ejemplo para un cliente en Windows con el alias SSH configurado. No crea reglas de Agency ni sustituye `metatrader-demo`:
