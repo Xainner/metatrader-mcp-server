@@ -1,0 +1,16 @@
+[Unit]
+Description=Read-only WhatsApp signal receiver (WPPConnect)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart=/usr/bin/docker run --rm --name trading-whatsapp-hub --cpus=1.5 --memory=2g --pids-limit=256 --shm-size=256m --cap-drop=ALL --security-opt=no-new-privileges --publish=127.0.0.1:18982:3000 --volume=%h/trading/whatsapp-hub:/data:rw trading/whatsapp-hub:0.1.0
+ExecStop=/usr/bin/docker stop -t 20 trading-whatsapp-hub
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=40
+
+[Install]
+WantedBy=default.target

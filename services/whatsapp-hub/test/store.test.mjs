@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Store } from '../src/store.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const config = {source_id:'test',enabled:true,allowed_group_ids:['123@g.us'],allowed_author_ids:[],capture_after:'2026-01-01T00:00:00Z'};
 const message = {id:'false_123@g.us_ABC',chatId:'123@g.us',author:'456@lid',timestamp:Date.now()/1000,type:'chat',body:'COMPRA ORO\nEntrada: 2500\nSL: 2495\nTP1: 2510'};
@@ -21,4 +24,17 @@ test('dedup delivery, preserve edits and original text including A B A',()=>{
   assert.equal(store.count(),3);
   assert.equal(store.known(message.chatId,message.id).text,message.body);
   assert.equal(store.known(message.chatId,message.id).revision,3);
+});
+test('events survive reopening and revoked message is a separate revision',()=>{
+  const home=mkdtempSync(join(tmpdir(),'whatsapp-test-'));
+  const file=join(home,'signals.sqlite3');
+  let store=new Store(file,'test');
+  try {
+    store.receive(message,config); store.db.close(); store=new Store(file,'test');
+    assert.equal(store.receive(message,config),false);
+    assert.equal(store.receive({...message,body:'',type:'revoked'},config,'revoke'),true);
+    assert.equal(store.known(message.chatId,message.id).content_kind,'revoked');
+    assert.equal(store.count(),2);
+    assert.throws(()=>store.receive(message,{...config,source_id:'other'}),/identity changed/);
+  } finally { store.db.close(); rmSync(home,{recursive:true}); }
 });
