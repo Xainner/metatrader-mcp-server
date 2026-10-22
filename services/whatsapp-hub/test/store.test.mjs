@@ -1,0 +1,24 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { Store } from '../src/store.mjs';
+
+const config = {source_id:'test',enabled:true,allowed_group_ids:['123@g.us'],allowed_author_ids:[],capture_after:'2026-01-01T00:00:00Z'};
+const message = {id:'false_123@g.us_ABC',chatId:'123@g.us',author:'456@lid',timestamp:Date.now()/1000,type:'chat',body:'COMPRA ORO\nEntrada: 2500\nSL: 2495\nTP1: 2510'};
+test('filter before storage and reject own, stale, disabled and unauthorized messages',()=>{
+  const store=new Store(':memory:','test');
+  for (const msg of [{...message,chatId:'999@g.us'},{...message,chatId:'123@c.us'},{...message,fromMe:true},{...message,timestamp:1}]) assert.equal(store.receive(msg,config),false);
+  assert.equal(store.receive(message,{...config,enabled:false}),false);
+  assert.equal(store.receive(message,{...config,allowed_author_ids:['999@lid']}),false);
+  assert.equal(store.count(),0);
+});
+test('dedup delivery, preserve edits and original text including A B A',()=>{
+  const store=new Store(':memory:','test');
+  assert.equal(store.receive(message,config),true);
+  assert.equal(store.receive(message,config),false);
+  assert.equal(store.receive({...message,body:'SL: 2496'},config,'edit'),true);
+  assert.equal(store.receive({...message,body:'SL: 2496'},config,'edit'),false);
+  assert.equal(store.receive(message,config,'edit'),true);
+  assert.equal(store.count(),3);
+  assert.equal(store.known(message.chatId,message.id).text,message.body);
+  assert.equal(store.known(message.chatId,message.id).revision,3);
+});

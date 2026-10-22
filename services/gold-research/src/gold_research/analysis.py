@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from types import FunctionType, SimpleNamespace
+from .spanish import parse_spanish
 
 UPSTREAM_COMMIT = '83d7faf8d7e131a9ed353c7920a2c456cc088807'
 PERIODS = {'M1': 60, 'M5': 300, 'M15': 900, 'H1': 3600, 'H4': 14400}
@@ -54,18 +55,23 @@ class Research:
             raise ValueError('Signal text must contain at most 12000 characters')
         result = {'state': 'noise', 'signal': None, 'errors': [], 'execution_authorized': False,
                   'parser': 'forex-gold', 'upstream_commit': UPSTREAM_COMMIT, 'tp_autocorrection': False}
-        if re.search(r'\b(CLOSE|CERRAR|CIERRA|BREAKEVEN|BREAK EVEN|RISK FREE)\b|\bSL\s*(?:A|TO)?\s*BE\b', text, re.I):
+        if re.search(r'\b(CLOSE|CERRAR|CIERRA|CERRAMOS|CIERRE|ASEGURAR|BREAKEVEN|BREAK EVEN|RISK FREE|SIN RIESGO|PUNTO DE ENTRADA|MOVER SL|SUBIR SL|BAJAR SL)\b|\bSL\s*(?:A|TO)?\s*BE\b', text, re.I):
             result.update(state='management_instruction', signal={'action_text': text, 'requires_correlated_trade': True},
                           errors=['Management requires an explicit correlated trade and current MT5 state'])
             return result
-        if re.search(r'^\s*(SL|STOP LOSS|TP\d*)\s*[:=]?\s*\d', text, re.I):
+        if re.search(r'^\s*(SL|STOP LOSS|TP\d*|OBJETIVO\s*\d*)\s*[:=]?\s*\d', text, re.I):
             result.update(state='awaiting_correlation', errors=['Levels-only update requires an explicit reply or signal identity'])
             return result
-        if not re.search(r'\b(GOLD|XAU\s*/?\s*USD(?:m)?)\b', text, re.I):
+        if not re.search(r'\b(ORO|GOLD|XAU\s*/?\s*USD(?:m)?)\b', text, re.I):
             return result
         # Broker suffix is an explicit alias; upstream's canonical instrument is XAUUSD.
         normalized = re.sub(r'\bXAUUSDm\b', 'XAUUSD', text, flags=re.I)
-        for parser in self.parsers:
+        spanish, candidate, spanish_errors = parse_spanish(text)
+        if spanish:
+            result['parser'] = 'spanish-explicit-v1 + forex-gold-validation'
+            if not candidate:
+                return {**result, 'state': 'quarantined', 'errors': spanish_errors}
+        for parser in ([lambda _: candidate] if spanish else self.parsers):
             try:
                 signal = parser(normalized)
             except (ValueError, TypeError, OverflowError):
@@ -75,7 +81,7 @@ class Research:
                 fields = [signal.get(key) for key in ('entry_low', 'entry_high', 'stop_loss')]
                 tps = [signal.get(f'tp{n}') for n in range(1, 9)]
                 numbers = [value for value in fields + tps if value is not None]
-                errors = []
+                errors = list(spanish_errors) if spanish else []
                 if any(not math.isfinite(float(value)) or float(value) <= 0 for value in numbers):
                     errors.append('Prices must be positive finite numbers')
                 if any(value is None for value in fields):

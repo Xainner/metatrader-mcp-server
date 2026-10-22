@@ -1,0 +1,7 @@
+{
+  "source_id": "whatsapp-main",
+  "enabled": false,
+  "allowed_group_ids": [],
+  "allowed_author_ids": [],
+  "capture_after": "2099-01-01T00:00:00Z"
+}

@@ -31,6 +31,11 @@ class Inbox:
             db.execute('CREATE TABLE IF NOT EXISTS evaluations (event_sequence INTEGER PRIMARY KEY, signal_id TEXT NOT NULL, revision INTEGER NOT NULL, state TEXT NOT NULL, event_json TEXT NOT NULL, result_json TEXT NOT NULL, evaluated_at TEXT NOT NULL)')
             db.execute('CREATE INDEX IF NOT EXISTS signal_identity ON evaluations(signal_id, revision)')
             db.execute('CREATE TABLE IF NOT EXISTS receipts (consumer TEXT NOT NULL, event_sequence INTEGER NOT NULL REFERENCES evaluations(event_sequence), at TEXT NOT NULL, PRIMARY KEY(consumer, event_sequence))')
+            db.execute('CREATE TABLE IF NOT EXISTS imports (source_id TEXT NOT NULL, raw_sequence INTEGER NOT NULL, event_sequence INTEGER NOT NULL UNIQUE REFERENCES evaluations(event_sequence), PRIMARY KEY(source_id,raw_sequence))')
+            # Backfill old rows without changing their public digest IDs or receipts.
+            for row in db.execute('SELECT event_sequence,event_json FROM evaluations WHERE event_sequence NOT IN (SELECT event_sequence FROM imports)').fetchall():
+                event = json.loads(row['event_json'])
+                db.execute('INSERT INTO imports VALUES (?,?,?)', (event['source_id'], event['sequence'], row['event_sequence']))
 
     def save(self, event, result):
         identity = f"{event['source_id']}:{event['chat_id']}:{event['message_id']}"
@@ -38,8 +43,13 @@ class Inbox:
             result = {**result, 'reply_signal_id': f"{event['source_id']}:{event['chat_id']}:{event['reply_to_message_id']}",
                       'correlation_requires_verification': True}
         with self.db() as db:
-            db.execute('INSERT OR IGNORE INTO evaluations VALUES (?, ?, ?, ?, ?, ?, ?)',
-                       (event['sequence'], identity, event['revision'], result['state'], json.dumps(event), json.dumps(result), datetime.now(timezone.utc).isoformat()))
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM imports WHERE source_id=? AND raw_sequence=?', (event['source_id'], event['sequence'])).fetchone():
+                return
+            # Global digest ID is allocated locally; each source keeps its raw sequence.
+            cursor = db.execute('INSERT INTO evaluations(signal_id,revision,state,event_json,result_json,evaluated_at) VALUES (?, ?, ?, ?, ?, ?)',
+                       (identity, event['revision'], result['state'], json.dumps(event), json.dumps(result), datetime.now(timezone.utc).isoformat()))
+            db.execute('INSERT INTO imports VALUES (?,?,?)', (event['source_id'], event['sequence'], cursor.lastrowid))
 
     @staticmethod
     def decode(row):
@@ -91,3 +101,7 @@ class Inbox:
     def last_sequence(self):
         with self.db() as db:
             return db.execute('SELECT COALESCE(MAX(event_sequence),0) FROM evaluations').fetchone()[0]
+
+    def source_sequence(self, source_id):
+        with self.db() as db:
+            return db.execute('SELECT COALESCE(MAX(raw_sequence),0) FROM imports WHERE source_id=?', (source_id,)).fetchone()[0]
