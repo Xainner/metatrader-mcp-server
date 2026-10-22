@@ -1,0 +1,22 @@
+[Unit]
+Description=FXTradingVision personal Telegram receiver (read only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading/telegram-user
+ExecStart=%h/trading/telegram-user/.venv/bin/python -m trading_telegram_user receiver
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/trading/telegram-user
+MemoryMax=256M
+CPUQuota=25%
+
+[Install]
+WantedBy=default.target
