@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Union
 
 import MetaTrader5 as mt5
 
-from ..risk import get_risk_guard
+from ..risk import bound_risk_guard
 from ..strategy import resolve_magic, validate_strategy_id
 from ..timebase import iso_utc
 from ..types import OrderType, TradeRequestActions
@@ -200,7 +200,7 @@ def preview_order(
             "note": "net volume adds buys and subtracts sells of this symbol; it is not a risk measure",
         }
 
-    guard = get_risk_guard(connection)
+    guard = bound_risk_guard(connection, mt5)
     risk_error = guard.check_account(mt5) or guard.check_new_order(
         mt5, symbol=symbol, side=side, volume=request["volume"], entry_price=entry,
         stop_loss=info["stop_loss"], magic=magic, strategy_id=strategy_id,

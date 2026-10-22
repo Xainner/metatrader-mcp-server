@@ -384,7 +384,7 @@ def test_position_and_remainder_listed_are_not_counted_twice(fake_mt5, connectio
     fake_mt5.orders = [make_order(ticket, type=0, volume=0.06)]
 
     assert try_buy(connection, 0.05)["error"] is False  # 0.04 + 0.06 listed + 0.05 = 0.15
-    assert connection.risk_guard._reservations[0].ticket != ticket  # the first reservation was released
+    assert connection.risk_guard.reservations()[0].ticket != ticket  # the first reservation was released
 
 
 def test_position_listed_but_remainder_not_listed_keeps_the_remainder(fake_mt5, connection):
@@ -440,7 +440,7 @@ def test_published_fills_are_reconciled_without_double_counting(fake_mt5, connec
     blocked = try_buy(connection, 0.06)
     assert blocked["error"] is True
     assert "Total exposure would be 0.16 lots" in blocked["message"]
-    assert connection.risk_guard._reservations == []
+    assert connection.risk_guard.reservations() == []
     assert try_buy(connection, 0.05)["error"] is False
 
 

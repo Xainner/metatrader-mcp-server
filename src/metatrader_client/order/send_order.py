@@ -18,7 +18,7 @@ from ..requests_registry import (
 	request_tag,
 	validate_request_id,
 )
-from ..risk import entries_block_reason, get_risk_guard
+from ..risk import bound_risk_guard, entries_block_reason
 from ..store import get_store
 from ..strategy import resolve_magic, validate_strategy_id
 from ..types import (
@@ -159,8 +159,15 @@ def _send_opening(
 		risk, _ = guard.loss_at_stop(
 			mt5, symbol=symbol, side=side, volume=request["volume"], entry_price=request["price"], stop_loss=stop_loss
 		) if stop_loss else (None, None)
+		# Final check and reservation in one transaction shared by every connection and process.
+		reservation_id, error = guard.commit_reservation(
+			volume=request["volume"], magic=request["magic"], risk=risk, request_id=request_id
+		)
+		if error:
+			return _reject_locally(registry, request_id, error)
 		response = _send_tracked(registry, request_id, request)
-		guard.after_send(response, duplicate_key, request["volume"], magic=request["magic"], risk=risk)
+		guard.after_send(response, duplicate_key, request["volume"], magic=request["magic"], risk=risk,
+		                 reservation_id=reservation_id)
 		return response
 
 
@@ -250,7 +257,7 @@ def send_order(
 		return failure("Invalid trade action")
 	order_type = _to_code(OrderType, order_type)
 	comment = comment if comment else "MCP"
-	guard = get_risk_guard(connection)
+	guard = bound_risk_guard(connection, mt5)
 
 	error = validate_strategy_id(strategy_id)
 	if error:

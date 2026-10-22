@@ -34,11 +34,18 @@ Guarantees and limits:
   rule moves from ``active`` to ``triggered`` with a compare-and-set, so two
   cycles or processes cannot execute it twice. Each close uses the request
   ID ``rule:<rule_id>:<ticket>``: repeating it never sends a second close.
-- After a restart, rules found ``triggered`` or ``executing`` become
-  ``pending_reconciliation``; they are never retried blindly.
-- A P&L that cannot be read, or a quote that has not changed for
-  ``MT5_SUPERVISOR_MAX_STALE_SECONDS`` (default 120), skips the evaluation; no
-  external price is used instead.
+- Rules found ``triggered`` or ``executing`` with another owner become
+  ``pending_reconciliation`` only once this supervisor holds the lease, i.e.
+  after the previous owner's lease lapsed (the lease lasts at least
+  ``MIN_LEASE_SECONDS``, longer than a close). They are never retried blindly.
+  Constructing a supervisor changes nothing.
+- Quote freshness: with ``MT5_SERVER_UTC_OFFSET_SECONDS`` the tick age is
+  computed from its timestamp; without it a quote counts as fresh only after
+  this process has seen its tick time change, and stays fresh for
+  ``MT5_SUPERVISOR_MAX_STALE_SECONDS`` (default 120) without a new change. The
+  first observation after a start is never evidence of freshness. A P&L that
+  cannot be read or a stale quote skips the evaluation; no external price is
+  used instead.
 - The loop depends on this process and its connection: it does not
   guarantee an exact price or result. Broker-side SL/TP remain the
   independent protection.
@@ -53,14 +60,14 @@ import os
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 
 from .serialization import to_plain
 from .store import Store, get_store
 from .strategy import strategy_magic, validate_strategy_id
-from .timebase import iso_utc
+from .timebase import age_seconds, iso_utc, server_utc_offset
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +75,7 @@ METRICS = ("pnl", "profit")
 OPERATORS = (">=", "<=")
 ACTIONS = ("close",)
 LEASE_NAME = "position_supervisor"
+MIN_LEASE_SECONDS = 180.0  # longer than a close request can take (MCP_SEND_TIMEOUT_SECONDS defaults to 60)
 DEAL_ENTRY_OUT = 1
 
 ACTIVE, PAUSED, TRIGGERED, EXECUTING = "active", "paused", "triggered", "executing"
@@ -172,14 +180,6 @@ class RuleStore:
 
     def release_lease(self, owner: str) -> None:
         self.store.execute("DELETE FROM leases WHERE name = ? AND owner = ?", (LEASE_NAME, owner))
-
-    def recover_interrupted(self) -> List[str]:
-        """Rules left triggered/executing by a stopped process become pending_reconciliation."""
-        ids = [r["rule_id"] for r in self.list(states=[TRIGGERED, EXECUTING])]
-        for rule_id in ids:
-            self.transition(rule_id, [TRIGGERED, EXECUTING], PENDING_RECONCILIATION,
-                            detail="interrupted (process stopped during the action); not retried")
-        return ids
 
 
 def get_rule_store(connection) -> RuleStore:
@@ -302,32 +302,64 @@ class PositionSupervisor:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_cycle: Optional[Dict[str, Any]] = None
-        recovered = self.rules.recover_interrupted()
-        if recovered:
-            logger.warning("Rules interrupted by a restart moved to pending_reconciliation: %s", recovered)
+        self.lease_ttl = max(3 * self.interval, MIN_LEASE_SECONDS)
 
-    # Quote freshness, measured by this process: how long the last tick time has not changed.
-    def _quote_age(self, symbol: str) -> Optional[float]:
+    def _quote_age(self, symbol: str) -> Tuple[Optional[float], Optional[str]]:
+        """
+        Age of the quote of ``symbol`` in seconds, or (None, reason) when it is unknown.
+
+        With the server offset configured the age comes from the tick timestamp.
+        Otherwise it is the time since this process saw the tick time change;
+        before the first change it is unknown.
+        """
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
-            return None
+            return None, f"no quote for {symbol}"
+        offset = server_utc_offset()
+        if offset is not None and getattr(tick, "time", None):
+            return age_seconds(tick.time, offset=offset), None
         tick_time = float(getattr(tick, "time_msc", 0) or getattr(tick, "time", 0) or 0)
         now = self._clock()
         seen = self._quotes.get(symbol)
-        if seen is None or seen["tick_time"] != tick_time:
-            self._quotes[symbol] = {"tick_time": tick_time, "first_seen": now}
-            return 0.0
-        return now - seen["first_seen"]
+        if seen is None:
+            self._quotes[symbol] = {"tick_time": tick_time, "changed_at": None}
+            return None, f"waiting for a new tick of {symbol} to prove the quote is fresh"
+        if seen["tick_time"] != tick_time:
+            self._quotes[symbol] = {"tick_time": tick_time, "changed_at": now}
+            return 0.0, None
+        if seen["changed_at"] is None:
+            return None, f"waiting for a new tick of {symbol} to prove the quote is fresh"
+        return now - seen["changed_at"], None
+
+    def recover_interrupted(self) -> List[str]:
+        """
+        Move rules left ``triggered``/``executing`` by another owner to
+        ``pending_reconciliation``. Only call it while holding the lease: the
+        previous owner's lease has then lapsed, so it is no longer working.
+        """
+        ids = [r["rule_id"] for r in self.rules.list(states=[TRIGGERED, EXECUTING]) if r.get("owner") != self.owner]
+        for rule_id in ids:
+            self.rules.transition(rule_id, [TRIGGERED, EXECUTING], PENDING_RECONCILIATION,
+                                  detail="interrupted (its supervisor stopped or lost the lease during the action); not retried")
+        if ids:
+            logger.warning("Interrupted rules moved to pending_reconciliation: %s", ids)
+        return ids
 
     def run_cycle(self) -> Dict[str, Any]:
         summary: Dict[str, Any] = {"started_at": iso_utc(time.time()), "evaluated": 0, "triggered": [], "skipped": None, "errors": []}
         active = self.rules.list(states=[ACTIVE])
-        if not active:
+        interrupted = self.rules.list(states=[TRIGGERED, EXECUTING])
+        if not active and not interrupted:
             summary["skipped"] = "no active rules"
             self.last_cycle = summary
             return summary
-        if not self.rules.acquire_lease(self.owner, ttl=max(3 * self.interval, 30.0)):
+        if not self.rules.acquire_lease(self.owner, ttl=self.lease_ttl):
             summary["skipped"] = "another supervisor holds the lease"
+            self.last_cycle = summary
+            return summary
+        summary["recovered"] = self.recover_interrupted() if interrupted else []
+        if not active:
+            summary["skipped"] = "no active rules"
             self.last_cycle = summary
             return summary
         account = mt5.account_info()
@@ -371,10 +403,10 @@ class PositionSupervisor:
             else:
                 self.rules.observe(rule_id, value=None, error="no open positions for the strategy")
             return
-        for symbol in {p.symbol for p in targets}:
-            age = self._quote_age(symbol)
+        for symbol in sorted({p.symbol for p in targets}):
+            age, reason = self._quote_age(symbol)
             if age is None:
-                self.rules.observe(rule_id, value=None, error=f"no quote for {symbol}; not evaluated")
+                self.rules.observe(rule_id, value=None, error=f"{reason}; not evaluated")
                 return
             if age > self.max_stale:
                 self.rules.observe(rule_id, value=None, error=f"quote of {symbol} unchanged for {age:.0f}s; P&L considered stale, not evaluated")
@@ -386,8 +418,10 @@ class PositionSupervisor:
         if not met:
             return
         observed_at = time.time()
+        if not self.rules.acquire_lease(self.owner, ttl=self.lease_ttl):
+            return  # the lease was lost: another supervisor owns the rules now
         if not self.rules.transition(rule_id, [ACTIVE], TRIGGERED, detail=f"{rule['metric']} {value} {rule['operator']} {rule['threshold']}",
-                                     triggered_value=value, triggered_at=observed_at):
+                                     triggered_value=value, triggered_at=observed_at, owner=self.owner):
             return  # another cycle or process got it first
         if not self.rules.transition(rule_id, [TRIGGERED], EXECUTING, detail="closing", owner=self.owner):
             return
@@ -400,6 +434,8 @@ class PositionSupervisor:
         results = []
         for position in targets:
             response = close_position(self.connection, position.ticket, request_id=f"rule:{rule['rule_id']}:{position.ticket}")
+            confirmed = response.get("verification") == "confirmed"
+            close_deal = getattr(response.get("data"), "deal", None) if confirmed else None
             results.append({
                 "ticket": position.ticket,
                 "error": response.get("error"),
@@ -407,7 +443,8 @@ class PositionSupervisor:
                 "verification": response.get("verification"),
                 "message": response.get("message"),
                 "floating_pnl_at_trigger": round(float(position.profit) + float(getattr(position, "swap", 0) or 0), 2),
-                "realized_net": self._realized(position.ticket) if response.get("verification") == "confirmed" else None,
+                "realized_net_close": self._realized_deal(close_deal) if close_deal else None,
+                "realized_net_position": self._realized(position.ticket) if confirmed else None,
             })
         verifications = {r["verification"] for r in results}
         if verifications == {"confirmed"}:
@@ -416,27 +453,44 @@ class PositionSupervisor:
             state, detail = FAILED, "the close was rejected; not retried"
         else:
             state, detail = PENDING_RECONCILIATION, "the outcome of at least one close is uncertain or partial; not retried"
-        realized = [r["realized_net"] for r in results if r["realized_net"] is not None]
+        realized = [r["realized_net_position"] for r in results if r["realized_net_position"] is not None]
         result = {
             "observed": {"metric": rule["metric"], "value": value, "threshold": rule["threshold"], "operator": rule["operator"],
                          "currency": rule["currency"], "observed_at": iso_utc(observed_at), "kind": "floating"},
             "action": rule["action"],
             "results": results,
-            "realized_net_total": round(sum(realized), 2) if len(realized) == len(results) else None,
-            "realized_note": "realized_net adds profit, commission, swap and fees of the closing deals; it differs from the floating value at the trigger",
+            "realized_net_position_total": round(sum(realized), 2) if len(realized) == len(results) else None,
+            "realized_note": (
+                "realized_net_position adds profit, commission, swap and fees of every deal of the position "
+                "(entry costs and earlier partial closes included); realized_net_close covers only the deal of "
+                "this close. Both differ from the floating value at the trigger."
+            ),
             "finished_at": iso_utc(time.time()),
         }
-        self.rules.transition(rule["rule_id"], [EXECUTING], state, detail=detail, result=result)
+        if not self.rules.transition(rule["rule_id"], [EXECUTING], state, detail=detail, result=result):
+            # Another supervisor recovered the rule meanwhile: keep the outcome in the audit trail.
+            self.rules.store.execute(
+                "INSERT INTO rule_events(rule_id, time, state, detail) VALUES (?, ?, ?, ?)",
+                (rule["rule_id"], time.time(), "late_result", json.dumps(to_plain({"state": state, "result": result}), default=str)),
+            )
+
+    @staticmethod
+    def _net(deals) -> float:
+        return round(sum(float(d.profit) + float(d.commission) + float(d.swap) + float(getattr(d, "fee", 0) or 0) for d in deals), 2)
 
     @staticmethod
     def _realized(ticket: int) -> Optional[float]:
+        """Net result of the whole position history: every deal's profit, commission, swap and fee."""
         deals = mt5.history_deals_get(position=ticket)
-        if not deals:
+        if not deals or not any(int(getattr(d, "entry", 0)) == DEAL_ENTRY_OUT for d in deals):
             return None
-        exits = [d for d in deals if int(getattr(d, "entry", 0)) == DEAL_ENTRY_OUT]
-        if not exits:
-            return None
-        return round(sum(float(d.profit) + float(d.commission) + float(d.swap) + float(getattr(d, "fee", 0) or 0) for d in exits), 2)
+        return PositionSupervisor._net(deals)
+
+    @staticmethod
+    def _realized_deal(deal_ticket: int) -> Optional[float]:
+        """Net result of one closing deal (without the entry costs of the position)."""
+        deals = mt5.history_deals_get(ticket=deal_ticket)
+        return PositionSupervisor._net(deals) if deals else None
 
     # Background loop -----------------------------------------------------
     def start(self, submit: Callable[[Callable[[], Dict[str, Any]]], Any]) -> None:

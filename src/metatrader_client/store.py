@@ -1,6 +1,7 @@
 """
-Durable local state kept in SQLite: trade request identities, the audit log
-of risk limits, the new-entries switch and position supervisor rules.
+Durable local state kept in SQLite: trade request identities, exposure
+reservations, the audit log of risk limits, the new-entries switch and
+position supervisor rules.
 
 Location: the ``state_db`` entry of the client config, else ``MT5_STATE_DB``,
 else ``~/.metatrader_mcp/state.sqlite3``. ``:memory:`` keeps everything in
@@ -115,6 +116,22 @@ _MIGRATIONS = [
         owner TEXT NOT NULL,
         expires_at REAL NOT NULL
     );
+    """,
+    # 3: exposure reservations shared by every connection and process using the store
+    """
+    CREATE TABLE reservations (
+        id TEXT PRIMARY KEY,
+        account_key TEXT NOT NULL,
+        request_id TEXT,
+        ticket INTEGER,
+        executed REAL NOT NULL,
+        working REAL NOT NULL,
+        magic INTEGER NOT NULL,
+        risk REAL,
+        status TEXT NOT NULL,
+        created_at REAL NOT NULL
+    );
+    CREATE INDEX reservations_account ON reservations(account_key);
     """,
 ]
 

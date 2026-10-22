@@ -50,6 +50,15 @@ def bump_tick(fake, symbol="EURUSD"):
     fake.ticks[symbol] = make_tick(tick.bid, tick.ask, time=tick.time + 1)
 
 
+def primed(conn, fake, clock=None, owner="one"):
+    """A supervisor that has already seen the EURUSD tick change, so its quote counts as fresh."""
+    sup = supervisor(conn, clock=clock, owner=owner)
+    sup._quote_age("EURUSD")
+    bump_tick(fake)
+    sup._quote_age("EURUSD")
+    return sup
+
+
 # ---------------------------------------------------------------------------
 # IMP-007
 # ---------------------------------------------------------------------------
@@ -67,7 +76,7 @@ def test_rule_closes_the_position_once_and_records_the_result(fake_mt5, conn):
     fake_mt5.positions = [make_position(1, profit=10)]
     rule = create_position_rule(conn, ticket=1, operator=">=", threshold=50)["data"]
     assert rule["state"] == "active" and rule["currency"] == "USD"
-    sup = supervisor(conn)
+    sup = primed(conn, fake_mt5)
 
     sup.run_cycle()
     assert list_position_rules(conn)["data"][0]["last_value"] == 10
@@ -92,7 +101,7 @@ def test_rule_closes_the_position_once_and_records_the_result(fake_mt5, conn):
 def test_two_supervisors_never_close_twice(fake_mt5, conn):
     fake_mt5.positions = [make_position(1, profit=100)]  # the close is not reflected: the position stays
     rule_id = create_position_rule(conn, ticket=1, operator=">=", threshold=50)["data"]["rule_id"]
-    first, second = supervisor(conn, owner="one"), supervisor(conn, owner="two")
+    first, second = primed(conn, fake_mt5, owner="one"), primed(conn, fake_mt5, owner="two")
 
     first.run_cycle()
     conn.store.execute("UPDATE leases SET expires_at = 0")  # the first owner's lease lapses
@@ -132,7 +141,7 @@ def test_uncertain_or_rejected_close_is_not_retried(fake_mt5, conn, make_result,
     fake_mt5.positions = [make_position(1, profit=100)]
     create_position_rule(conn, ticket=1, operator=">=", threshold=50)
     fake_mt5.results = [make_result(fake_mt5)]
-    sup = supervisor(conn)
+    sup = primed(conn, fake_mt5)
 
     sup.run_cycle()
     sup.run_cycle()
@@ -144,7 +153,7 @@ def test_uncertain_or_rejected_close_is_not_retried(fake_mt5, conn, make_result,
 def test_partial_close_is_pending_reconciliation(fake_mt5, conn):
     fake_mt5.positions = [make_position(1, profit=100)]  # close accepted but the position stays listed
     create_position_rule(conn, ticket=1, operator=">=", threshold=50)
-    supervisor(conn).run_cycle()
+    primed(conn, fake_mt5).run_cycle()
     assert list_position_rules(conn)["data"][0]["state"] == "pending_reconciliation"
 
 
@@ -152,9 +161,8 @@ def test_stale_or_unreadable_pnl_is_not_evaluated(fake_mt5, conn, monkeypatch):
     fake_mt5.positions = [make_position(1, profit=100)]
     create_position_rule(conn, ticket=1, operator=">=", threshold=50)
     clock = Clock()
-    sup = supervisor(conn, clock=clock)
-    sup._quote_age("EURUSD")  # first observation of the current tick
-    clock.now = 120  # the tick has not changed for two minutes
+    sup = primed(conn, fake_mt5, clock=clock)  # the tick changed at clock 0
+    clock.now = 120  # and has not changed for two minutes
 
     sup.run_cycle()
     rule = list_position_rules(conn)["data"][0]
@@ -172,7 +180,7 @@ def test_strategy_rule_closes_only_its_positions(fake_mt5, conn):
     fake_mt5.positions = [make_position(1, magic=magic, profit=-30), make_position(2, magic=magic, profit=-25), make_position(3, profit=-500)]
     create_position_rule(conn, strategy_id="alpha", operator="<=", threshold=-50)
 
-    supervisor(conn).run_cycle()
+    primed(conn, fake_mt5).run_cycle()
 
     rule = list_position_rules(conn)["data"][0]
     assert rule["state"] == "fulfilled" and rule["triggered_value"] == -55

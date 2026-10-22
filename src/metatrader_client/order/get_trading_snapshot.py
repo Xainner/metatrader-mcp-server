@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, Optional
 
 import MetaTrader5 as mt5
 
-from ..risk import entries_block_reason, get_risk_guard
+from ..risk import bound_risk_guard, entries_block_reason
 from ..store import get_store
 from ..strategy import ownership, strategy_magic, validate_strategy_id
 from ..timebase import age_seconds, describe_server_time, iso_utc, server_utc_offset
@@ -185,7 +185,7 @@ def get_trading_snapshot(connection, *, symbol: str, strategy_id: Optional[str] 
         }
 
     # Limits and current use
-    guard = get_risk_guard(connection)
+    guard = bound_risk_guard(connection, mt5)
     cfg = guard.config
     limits = {
         "status": "ok",

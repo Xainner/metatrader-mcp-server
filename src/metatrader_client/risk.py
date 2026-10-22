@@ -57,7 +57,16 @@ When a limit needs terminal data that cannot be read (``positions_get``,
 blocked instead of assuming that there is none.
 
 Concurrency: the checks, the request and the reservation of an opening order
-run under one lock per :class:`RiskGuard` (one per connection). An order that
+run under one lock per :class:`RiskGuard` (one per connection). Reservations
+are kept in the shared SQLite store (``metatrader_client.store``), keyed by
+account and server, so every connection and process using the same store
+sees them. Before ``order_send`` the reservation-dependent limits (open
+positions, total volume, daily entries, aggregate risk) are evaluated again
+and the reservation is inserted in one ``BEGIN IMMEDIATE`` transaction, which
+serializes competing openings across connections and processes; the second
+one sees the first one's reservation and is rejected if the budget is spent.
+The listings and stop-loss losses used by that final check are the ones read
+by :meth:`RiskGuard.check_new_order` just before. An order that
 was sent is reserved until the terminal lists it or ``RESERVATION_TTL_SECONDS``
 pass. The reservation is reconciled by volume: the committed volume (executed
 plus still working) minus what the listings show for its ticket (position
@@ -68,9 +77,9 @@ remainder) stays reserved until the TTL. A partial fill with RETURN filling
 keeps its remainder committed; with IOC or FOK the remainder is cancelled by
 the server and is not reserved. A rejected order
 reserves nothing; an order with an unknown outcome stays reserved for the full
-TTL. The protection covers threads sharing a connection in one process. It does
-not coordinate other processes, other connections, manual trading or other
-robots using the same account.
+TTL. The protection covers every connection and process sharing the state
+database. It does not coordinate processes with another database, manual
+trading or other robots using the same account.
 """
 
 import json
@@ -78,6 +87,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
@@ -224,6 +234,8 @@ class _Reservation:
     created: float
     magic: int = 0
     risk: Optional[float] = None
+    id: Optional[str] = None
+    status: str = "sent"
 
     def unlisted(self, positions, orders) -> Tuple[float, int]:
         """
@@ -270,9 +282,64 @@ class RiskGuard:
     def __init__(self, config: Optional[RiskConfig] = None):
         self.config = config or RiskConfig()
         self._recent: Dict[Hashable, float] = {}
-        self._reservations: List[_Reservation] = []
         self._lock = threading.Lock()
         self._opening_lock = threading.Lock()
+        self._store = None
+        self._account_key = "unknown"
+        self._plans = threading.local()
+
+    # ------------------------------------------------------------------
+    # Shared reservation book
+    # ------------------------------------------------------------------
+    def bind(self, store, account_key: Optional[str]) -> None:
+        """
+        Keep reservations in ``store`` under ``account_key`` (``login@server``).
+
+        Guards bound to the same store and account see each other's
+        reservations. An unbound guard uses a private in-memory store.
+        """
+        self._store = store
+        self._account_key = account_key or "unknown"
+
+    def _book(self):
+        if self._store is None:
+            from .store import Store
+            self._store = Store(":memory:")
+        return self._store
+
+    def _rows(self, db, now: float) -> List[_Reservation]:
+        """Live reservations of the bound account; expired ones are deleted."""
+        db.execute(
+            "DELETE FROM reservations WHERE account_key = ? AND created_at <= ?",
+            (self._account_key, now - RESERVATION_TTL_SECONDS),
+        )
+        rows = db.execute(
+            "SELECT * FROM reservations WHERE account_key = ? ORDER BY created_at", (self._account_key,)
+        ).fetchall()
+        return [
+            _Reservation(
+                ticket=r["ticket"], executed=r["executed"], working=r["working"], created=r["created_at"],
+                magic=r["magic"], risk=r["risk"], id=r["id"], status=r["status"],
+            )
+            for r in rows
+        ]
+
+    def _reserved(self, db, positions, orders, *, magic: Optional[int], now: float) -> List[Tuple[float, int, Optional[float]]]:
+        unlisted: List[Tuple[float, int, Optional[float]]] = []
+        for reservation in self._rows(db, now):
+            volume, slots = reservation.unlisted(positions, orders)
+            if volume <= _EPS and slots == 0:
+                if reservation.status == "sent":
+                    db.execute("DELETE FROM reservations WHERE id = ?", (reservation.id,))
+                continue
+            if magic is not None and reservation.magic != magic:
+                continue
+            committed = reservation.executed + reservation.working
+            risk = None
+            if reservation.risk is not None and committed > _EPS:
+                risk = reservation.risk * min(1.0, volume / committed)
+            unlisted.append((volume, slots, risk))
+        return unlisted
 
     @contextmanager
     def opening(self) -> Iterator[None]:
@@ -342,17 +409,28 @@ class RiskGuard:
             scopes.append((f"strategy {strategy_id}", strategy_limits, int(magic or 0)))
 
         new_order = {"symbol": symbol, "side": side, "volume": volume, "entry_price": entry_price, "stop_loss": stop_loss}
+        plan: Dict[str, Any] = {"positions": None, "orders": None, "scopes": [], "equity": None, "currency": None, "new_risk": None}
+        self._plans.current = None
         for label, limits, scope_magic in scopes:
-            error = self._check_scope(mt5, label=label, limits=limits, magic=scope_magic, new_order=new_order)
+            error = self._check_scope(mt5, label=label, limits=limits, magic=scope_magic, new_order=new_order, plan=plan)
             if error:
                 return error
+        self._plans.current = plan
 
         return self.check_stop_loss_risk(
             mt5, symbol=symbol, side=side, volume=volume, entry_price=entry_price, stop_loss=stop_loss
         )
 
-    def _check_scope(self, mt5, *, label: str, limits: Mapping[str, Any], magic: Optional[int], new_order: Dict[str, Any]) -> Optional[str]:
-        """Apply one set of limits to the items of a scope (``magic`` None means the whole account)."""
+    def _check_scope(self, mt5, *, label: str, limits: Mapping[str, Any], magic: Optional[int],
+                     new_order: Dict[str, Any], plan: Dict[str, Any]) -> Optional[str]:
+        """
+        Apply one set of limits to the items of a scope (``magic`` None means the whole account).
+
+        The values that do not depend on reservations (listed positions and
+        orders, today's entries, losses at the stop losses) are kept in
+        ``plan`` so :meth:`commit_reservation` can evaluate the limits again
+        against the shared reservations without reading the terminal.
+        """
         volume = new_order["volume"]
         prefix = "" if magic is None else f"[{label}] "
 
@@ -364,57 +442,44 @@ class RiskGuard:
             limits.get(k) is not None
             for k in ("max_total_volume", "max_open_positions", "max_entries_per_day", "max_aggregate_risk_pct")
         )
-        positions = orders = None
-        reserved: List[Tuple[float, int, Optional[float]]] = []
         if needs_listings:
-            positions, error = _read(mt5, "positions_get")
-            if error:
-                return f"{prefix}Cannot verify exposure limits, new orders are blocked: {error}"
-            orders, error = _read(mt5, "orders_get")
-            if error:
-                return f"{prefix}Cannot verify exposure limits, new orders are blocked: {error}"
-            reserved = self._unlisted_reservations(positions, orders, magic=magic)
+            if plan["positions"] is None:
+                positions, error = _read(mt5, "positions_get")
+                if error:
+                    return f"{prefix}Cannot verify exposure limits, new orders are blocked: {error}"
+                orders, error = _read(mt5, "orders_get")
+                if error:
+                    return f"{prefix}Cannot verify exposure limits, new orders are blocked: {error}"
+                plan["positions"], plan["orders"] = positions, orders
+            positions, orders = plan["positions"], plan["orders"]
             if magic is not None:
                 positions = tuple(p for p in positions if int(getattr(p, "magic", 0) or 0) == magic)
                 orders = tuple(o for o in orders if int(getattr(o, "magic", 0) or 0) == magic)
-
-        max_open = limits.get("max_open_positions")
-        if max_open is not None:
-            reserved_slots = sum(slots for _, slots, _ in reserved)
-            open_count = len(positions) + len(orders) + reserved_slots
-            if open_count + 1 > max_open:
-                return (
-                    f"{prefix}Opening this order would exceed the limit of {max_open} "
-                    f"open positions and pending orders ({len(positions)} positions, {len(orders)} orders, "
-                    f"{reserved_slots} recently sent and not listed yet)"
-                )
-
-        max_total = limits.get("max_total_volume")
-        if max_total is not None:
-            current = (
-                sum(float(p.volume) for p in positions)
-                + sum(float(o.volume_current) for o in orders)
-                + sum(v for v, _, _ in reserved)
-            )
-            if current + volume > max_total + 1e-9:
-                return (
-                    f"{prefix}Total exposure would be {round(current + volume, 8)} lots, "
-                    f"above the limit of {max_total} lots"
-                )
-
-        max_entries = limits.get("max_entries_per_day")
-        if max_entries is not None:
-            error = self._check_entries(mt5, limit=max_entries, orders=orders, reserved=reserved,
-                                        magic=magic, symbol=new_order["symbol"], prefix=prefix)
+            scope = {
+                "prefix": prefix,
+                "magic": magic,
+                "limits": dict(limits),
+                "positions": len(positions),
+                "orders": len(orders),
+                "volume": sum(float(p.volume) for p in positions) + sum(float(o.volume_current) for o in orders),
+                "opened": 0,
+                "base_risk": None,
+            }
+            if limits.get("max_entries_per_day") is not None:
+                opened, error = self._opened_today(mt5, magic=magic, symbol=new_order["symbol"])
+                if error:
+                    return f"{prefix}Cannot verify the daily entries limit, new orders are blocked: {error}"
+                scope["opened"] = opened
+            if limits.get("max_aggregate_risk_pct") is not None:
+                error = self._prepare_aggregate_risk(mt5, scope=scope, positions=positions, orders=orders,
+                                                     new_order=new_order, plan=plan, prefix=prefix)
+                if error:
+                    return error
+            reserved = self._unlisted_reservations(plan["positions"], plan["orders"], magic=magic)
+            error = self._evaluate_scope(scope, reserved, volume=volume, plan=plan)
             if error:
                 return error
-
-        max_aggregate = limits.get("max_aggregate_risk_pct")
-        if max_aggregate is not None:
-            error = self._check_aggregate_risk(mt5, limit=max_aggregate, positions=positions, orders=orders,
-                                               reserved=reserved, new_order=new_order, prefix=prefix)
-            if error:
-                return error
+            plan["scopes"].append(scope)
 
         max_daily = limits.get("max_daily_loss")
         if max_daily is not None:
@@ -423,47 +488,94 @@ class RiskGuard:
                 return f"{prefix}{error}"
         return None
 
-    def _check_entries(self, mt5, *, limit: int, orders, reserved, magic: Optional[int], symbol: str, prefix: str) -> Optional[str]:
+    def _evaluate_scope(self, scope: Dict[str, Any], reserved, *, volume: float, plan: Dict[str, Any]) -> Optional[str]:
+        """Limits that depend on reservations, from the values prepared in ``scope``."""
+        limits, prefix = scope["limits"], scope["prefix"]
+
+        max_open = limits.get("max_open_positions")
+        if max_open is not None:
+            reserved_slots = sum(slots for _, slots, _ in reserved)
+            open_count = scope["positions"] + scope["orders"] + reserved_slots
+            if open_count + 1 > max_open:
+                return (
+                    f"{prefix}Opening this order would exceed the limit of {max_open} "
+                    f"open positions and pending orders ({scope['positions']} positions, {scope['orders']} orders, "
+                    f"{reserved_slots} recently sent and not listed yet)"
+                )
+
+        max_total = limits.get("max_total_volume")
+        if max_total is not None:
+            current = scope["volume"] + sum(v for v, _, _ in reserved)
+            if current + volume > max_total + 1e-9:
+                return (
+                    f"{prefix}Total exposure would be {round(current + volume, 8)} lots, "
+                    f"above the limit of {max_total} lots"
+                )
+
+        max_entries = limits.get("max_entries_per_day")
+        if max_entries is not None:
+            unlisted = sum(1 for v, _, _ in reserved if v > _EPS)
+            total = scope["opened"] + scope["orders"] + unlisted
+            if total + 1 > max_entries:
+                return (
+                    f"{prefix}Daily entries limit of {max_entries} reached ({scope['opened']} entries today, "
+                    f"{scope['orders']} pending orders that may trigger, {unlisted} sent and not listed yet)"
+                )
+
+        max_aggregate = limits.get("max_aggregate_risk_pct")
+        if max_aggregate is not None:
+            total = scope["base_risk"]
+            for unlisted_volume, _, risk in reserved:
+                if unlisted_volume <= _EPS:
+                    continue
+                if risk is None:
+                    return f"{prefix}Aggregate risk cannot be evaluated: an order sent without stop loss is not listed yet"
+                total += risk
+            total += plan["new_risk"]
+            pct = total / plan["equity"] * 100
+            if pct > max_aggregate + 1e-9:
+                return (
+                    f"{prefix}Aggregate loss at stop losses would be {total:.2f} {plan['currency']} "
+                    f"({pct:.2f}% of equity), above the limit of {max_aggregate}%"
+                )
+        return None
+
+    def _opened_today(self, mt5, *, magic: Optional[int], symbol: str) -> Tuple[Optional[int], Optional[str]]:
         """
         Entries of the server day: deals that opened or reversed a position
-        today, plus pending orders that may still trigger, plus orders sent and
-        not listed yet. The new order counts as one more entry.
+        today. Pending orders that may still trigger and orders sent and not
+        listed yet are added by :meth:`_evaluate_scope`; the new order counts
+        as one more entry.
         """
         deals, error = self._today_deals(mt5, symbol)
         if error:
-            return f"{prefix}Cannot verify the daily entries limit, new orders are blocked: {error}"
+            return None, error
         opened = [
             d for d in deals
             if int(getattr(d, "entry", DEAL_ENTRY_IN)) in (DEAL_ENTRY_IN, DEAL_ENTRY_INOUT)
             and d.type in (DEAL_TYPE_BUY, DEAL_TYPE_SELL)
             and (magic is None or int(getattr(d, "magic", 0) or 0) == magic)
         ]
-        pending = len(orders)
-        unlisted = sum(1 for v, _, _ in reserved if v > _EPS)
-        total = len(opened) + pending + unlisted
-        if total + 1 > limit:
-            return (
-                f"{prefix}Daily entries limit of {limit} reached ({len(opened)} entries today, "
-                f"{pending} pending orders that may trigger, {unlisted} sent and not listed yet)"
-            )
-        return None
+        return len(opened), None
 
-    def _check_aggregate_risk(self, mt5, *, limit: float, positions, orders, reserved, new_order, prefix: str) -> Optional[str]:
+    def _prepare_aggregate_risk(self, mt5, *, scope, positions, orders, new_order, plan, prefix: str) -> Optional[str]:
         """
-        Sum of the losses at the stop loss of every position, pending order,
-        unlisted reservation and the new order, as a percentage of equity.
+        Losses at the stop loss of the listed positions and pending orders of
+        the scope, and of the new order, for the aggregate risk limit.
 
         Rules: each item contributes the loss from its current price (positions)
         or order price (pending orders) to its stop loss; a stop loss beyond the
         entry in the profitable direction contributes 0; opposite positions are
         not netted; an item without stop loss makes the total unknown, which
-        blocks the order.
+        blocks the order. Unlisted reservations are added with the loss stored
+        when they were sent.
         """
-        account = mt5.account_info()
-        if account is None:
-            return f"{prefix}Cannot read account information to check the aggregate risk"
-        equity = float(account.equity)
-        if equity <= 0:
+        if plan["equity"] is None:
+            account = mt5.account_info()
+            if account is None:
+                return f"{prefix}Cannot read account information to check the aggregate risk"
+            plan["equity"], plan["currency"] = float(account.equity), account.currency
+        if plan["equity"] <= 0:
             return f"{prefix}Account equity is not positive"
 
         total = 0.0
@@ -483,24 +595,14 @@ class RiskGuard:
             if error:
                 return f"{prefix}Aggregate risk cannot be evaluated: {error}"
             total += loss
-        for volume, _, risk in reserved:
-            if volume <= _EPS:
-                continue
-            if risk is None:
-                return f"{prefix}Aggregate risk cannot be evaluated: an order sent without stop loss is not listed yet"
-            total += risk
-        if not new_order["stop_loss"]:
-            return f"{prefix}Aggregate risk cannot be evaluated: the new order has no stop loss"
-        loss, error = self.loss_at_stop(mt5, **new_order)
-        if error:
-            return f"{prefix}Aggregate risk cannot be evaluated: {error}"
-        total += loss
-        pct = total / equity * 100
-        if pct > limit + 1e-9:
-            return (
-                f"{prefix}Aggregate loss at stop losses would be {total:.2f} {account.currency} "
-                f"({pct:.2f}% of equity), above the limit of {limit}%"
-            )
+        if plan["new_risk"] is None:
+            if not new_order["stop_loss"]:
+                return f"{prefix}Aggregate risk cannot be evaluated: the new order has no stop loss"
+            loss, error = self.loss_at_stop(mt5, **new_order)
+            if error:
+                return f"{prefix}Aggregate risk cannot be evaluated: {error}"
+            plan["new_risk"] = loss
+        scope["base_risk"] = total
         return None
 
     @staticmethod
@@ -635,6 +737,37 @@ class RiskGuard:
     # ------------------------------------------------------------------
     # Reservations of exposure sent but not yet listed by the terminal
     # ------------------------------------------------------------------
+    def commit_reservation(self, *, volume: float, magic: int = 0, risk: Optional[float] = None,
+                           request_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Evaluate the reservation-dependent limits again and reserve the order, atomically.
+
+        Runs in one ``BEGIN IMMEDIATE`` transaction of the shared store, so two
+        connections or processes cannot both use the last part of a budget:
+        the second one sees the first one's reservation. It uses the listings
+        and losses prepared by the last :meth:`check_new_order` of this thread.
+
+        Returns ``(reservation_id, None)`` or ``(None, error)``.
+        """
+        plan = getattr(self._plans, "current", None)
+        self._plans.current = None
+        now = time.time()
+        with self._book().transaction() as db:
+            if plan is not None:
+                for scope in plan["scopes"]:
+                    reserved = self._reserved(db, plan["positions"], plan["orders"], magic=scope["magic"], now=now)
+                    error = self._evaluate_scope(scope, reserved, volume=float(volume), plan=plan)
+                    if error:
+                        return None, error
+            reservation_id = uuid.uuid4().hex
+            # Until the outcome is known the whole volume is reserved without ticket (counted as unlisted).
+            db.execute(
+                "INSERT INTO reservations(id, account_key, request_id, ticket, executed, working, magic, risk, status, created_at) "
+                "VALUES (?, ?, ?, NULL, ?, 0, ?, ?, 'pending', ?)",
+                (reservation_id, self._account_key, request_id, float(volume), int(magic or 0), risk, now),
+            )
+        return reservation_id, None
+
     def after_send(
         self,
         response: Dict[str, Any],
@@ -643,6 +776,7 @@ class RiskGuard:
         *,
         magic: int = 0,
         risk: Optional[float] = None,
+        reservation_id: Optional[str] = None,
     ) -> None:
         """
         Apply the reservation policy to the outcome of an opening order.
@@ -656,9 +790,15 @@ class RiskGuard:
         - no_response: the requested volume is reserved for the full TTL and the
           request is remembered, because it may have been executed.
         - rejected or anything else: nothing is reserved.
+
+        ``reservation_id`` is the pending reservation of :meth:`commit_reservation`;
+        it is updated with the outcome (or deleted). Without it a new one is stored.
         """
         status = response.get("status")
+        book = self._book()
         if status not in ("done", "placed", "partial", "no_response"):
+            if reservation_id:
+                book.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
             return
         if duplicate_key is not None:
             self.record(duplicate_key)
@@ -679,13 +819,22 @@ class RiskGuard:
         else:  # no_response: no ticket, kept for the full TTL
             executed, working = volume, 0.0
 
-        with self._lock:
-            self._reservations.append(
-                _Reservation(
-                    ticket=ticket, executed=executed, working=working, created=time.monotonic(),
-                    magic=int(magic or 0), risk=risk,
-                )
+        if reservation_id:
+            book.execute(
+                "UPDATE reservations SET ticket = ?, executed = ?, working = ?, status = 'sent' WHERE id = ?",
+                (ticket, executed, working, reservation_id),
             )
+        else:
+            book.execute(
+                "INSERT INTO reservations(id, account_key, request_id, ticket, executed, working, magic, risk, status, created_at) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'sent', ?)",
+                (uuid.uuid4().hex, self._account_key, ticket, executed, working, int(magic or 0), risk, time.time()),
+            )
+
+    def reservations(self) -> List[_Reservation]:
+        """Live reservations of the bound account (expired ones are dropped)."""
+        with self._book().transaction() as db:
+            return self._rows(db, time.time())
 
     def _unlisted_reservations(self, positions, orders, *, magic: Optional[int] = None) -> List[Tuple[float, int, Optional[float]]]:
         """
@@ -696,26 +845,8 @@ class RiskGuard:
         loss at the stop loss of the unlisted part (None without stop loss).
         With ``magic``, only reservations of that magic number are returned.
         """
-        now = time.monotonic()
-        unlisted: List[Tuple[float, int, Optional[float]]] = []
-        with self._lock:
-            kept = []
-            for reservation in self._reservations:
-                if now - reservation.created >= RESERVATION_TTL_SECONDS:
-                    continue
-                volume, slots = reservation.unlisted(positions, orders)
-                if volume <= _EPS and slots == 0:
-                    continue
-                kept.append(reservation)
-                if magic is not None and reservation.magic != magic:
-                    continue
-                committed = reservation.executed + reservation.working
-                risk = None
-                if reservation.risk is not None and committed > _EPS:
-                    risk = reservation.risk * min(1.0, volume / committed)
-                unlisted.append((volume, slots, risk))
-            self._reservations = kept
-        return unlisted
+        with self._book().transaction() as db:
+            return self._reserved(db, positions, orders, magic=magic, now=time.time())
 
 
 _default_guard: Optional[RiskGuard] = None
@@ -732,6 +863,23 @@ def get_risk_guard(connection) -> RiskGuard:
         if _default_guard is None:
             _default_guard = RiskGuard(RiskConfig.from_sources())
         return _default_guard
+
+
+def account_key(mt5) -> str:
+    """``login@server`` of the connected account, used to share reservations."""
+    account = mt5.account_info()
+    if account is None:
+        return "unknown"
+    return f"{getattr(account, 'login', '')}@{getattr(account, 'server', '')}"
+
+
+def bound_risk_guard(connection, mt5) -> RiskGuard:
+    """The connection's guard, bound to the connection's store and the connected account."""
+    from .store import get_store
+
+    guard = get_risk_guard(connection)
+    guard.bind(get_store(connection), account_key(mt5))
+    return guard
 
 
 # ----------------------------------------------------------------------
