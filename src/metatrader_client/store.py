@@ -133,6 +133,13 @@ _MIGRATIONS = [
     );
     CREATE INDEX reservations_account ON reservations(account_key);
     """,
+    # 4: version of each account's reservation book, bumped by every change
+    """
+    CREATE TABLE reservation_versions (
+        account_key TEXT PRIMARY KEY,
+        version INTEGER NOT NULL
+    );
+    """,
 ]
 
 

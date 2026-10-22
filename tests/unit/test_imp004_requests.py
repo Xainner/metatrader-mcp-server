@@ -211,4 +211,4 @@ def test_purge_keeps_unresolved_requests(store):
 
 
 def test_store_schema_is_versioned(store):
-    assert store.schema_version == 3
+    assert store.schema_version == 4

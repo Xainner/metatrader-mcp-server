@@ -66,7 +66,13 @@ and the reservation is inserted in one ``BEGIN IMMEDIATE`` transaction, which
 serializes competing openings across connections and processes; the second
 one sees the first one's reservation and is rejected if the budget is spent.
 The listings and stop-loss losses used by that final check are the ones read
-by :meth:`RiskGuard.check_new_order` just before. An order that
+by :meth:`RiskGuard.check_new_order` just before, together with the version
+of the account's reservation book they were reconciled with. Every change of
+the book (a reservation stored, updated, released because the terminal lists
+it, or expired) bumps that version; if it changed before the final check, the
+listings are read again and the limits re-evaluated (up to
+``MAX_COMMIT_ATTEMPTS`` times), so a reservation released by another reader
+can never be missing from both the listings and the book. An order that
 was sent is reserved until the terminal lists it or ``RESERVATION_TTL_SECONDS``
 pass. The reservation is reconciled by volume: the committed volume (executed
 plus still working) minus what the listings show for its ticket (position
@@ -97,6 +103,7 @@ logger = logging.getLogger(__name__)
 
 ACCOUNT_TRADE_MODE_DEMO = 0
 RESERVATION_TTL_SECONDS = 60.0
+MAX_COMMIT_ATTEMPTS = 3
 ORDER_FILLING_FOK = 0
 ORDER_FILLING_IOC = 1
 _EPS = 1e-9
@@ -307,12 +314,26 @@ class RiskGuard:
             self._store = Store(":memory:")
         return self._store
 
+    def _version(self, db) -> int:
+        row = db.execute("SELECT version FROM reservation_versions WHERE account_key = ?", (self._account_key,)).fetchone()
+        return int(row["version"]) if row else 0
+
+    def _bump(self, db) -> None:
+        """Record that the reservation book of the account changed (call inside the changing transaction)."""
+        db.execute(
+            "INSERT INTO reservation_versions(account_key, version) VALUES (?, 1) "
+            "ON CONFLICT(account_key) DO UPDATE SET version = version + 1",
+            (self._account_key,),
+        )
+
     def _rows(self, db, now: float) -> List[_Reservation]:
         """Live reservations of the bound account; expired ones are deleted."""
-        db.execute(
+        expired = db.execute(
             "DELETE FROM reservations WHERE account_key = ? AND created_at <= ?",
             (self._account_key, now - RESERVATION_TTL_SECONDS),
-        )
+        ).rowcount
+        if expired:
+            self._bump(db)
         rows = db.execute(
             "SELECT * FROM reservations WHERE account_key = ? ORDER BY created_at", (self._account_key,)
         ).fetchall()
@@ -331,6 +352,7 @@ class RiskGuard:
             if volume <= _EPS and slots == 0:
                 if reservation.status == "sent":
                     db.execute("DELETE FROM reservations WHERE id = ?", (reservation.id,))
+                    self._bump(db)
                 continue
             if magic is not None and reservation.magic != magic:
                 continue
@@ -408,18 +430,30 @@ class RiskGuard:
         if strategy_limits:
             scopes.append((f"strategy {strategy_id}", strategy_limits, int(magic or 0)))
 
-        new_order = {"symbol": symbol, "side": side, "volume": volume, "entry_price": entry_price, "stop_loss": stop_loss}
-        plan: Dict[str, Any] = {"positions": None, "orders": None, "scopes": [], "equity": None, "currency": None, "new_risk": None}
         self._plans.current = None
-        for label, limits, scope_magic in scopes:
-            error = self._check_scope(mt5, label=label, limits=limits, magic=scope_magic, new_order=new_order, plan=plan)
-            if error:
-                return error
+        order = {"symbol": symbol, "side": side, "volume": volume, "entry_price": entry_price,
+                 "stop_loss": stop_loss, "magic": magic, "strategy_id": strategy_id}
+        plan, error = self._plan(mt5, scopes, order)
+        if error:
+            return error
         self._plans.current = plan
 
         return self.check_stop_loss_risk(
             mt5, symbol=symbol, side=side, volume=volume, entry_price=entry_price, stop_loss=stop_loss
         )
+
+    def _plan(self, mt5, scopes, order: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Read the listings, evaluate every scope and return the plan used by :meth:`commit_reservation`."""
+        new_order = {k: order[k] for k in ("symbol", "side", "volume", "entry_price", "stop_loss")}
+        plan: Dict[str, Any] = {
+            "positions": None, "orders": None, "scopes": [], "equity": None, "currency": None,
+            "new_risk": None, "version": None, "order": order, "scope_specs": scopes,
+        }
+        for label, limits, scope_magic in scopes:
+            error = self._check_scope(mt5, label=label, limits=limits, magic=scope_magic, new_order=new_order, plan=plan)
+            if error:
+                return None, error
+        return plan, None
 
     def _check_scope(self, mt5, *, label: str, limits: Mapping[str, Any], magic: Optional[int],
                      new_order: Dict[str, Any], plan: Dict[str, Any]) -> Optional[str]:
@@ -475,7 +509,13 @@ class RiskGuard:
                                                      new_order=new_order, plan=plan, prefix=prefix)
                 if error:
                     return error
-            reserved = self._unlisted_reservations(plan["positions"], plan["orders"], magic=magic)
+            with self._book().transaction() as db:
+                reserved = self._reserved(db, plan["positions"], plan["orders"], magic=magic, now=time.time())
+                version = self._version(db)
+            if plan["version"] is None:
+                plan["version"] = version
+            elif plan["version"] != version:
+                plan["version"] = -1  # the book changed between scopes: force a re-read at commit
             error = self._evaluate_scope(scope, reserved, volume=volume, plan=plan)
             if error:
                 return error
@@ -738,35 +778,53 @@ class RiskGuard:
     # Reservations of exposure sent but not yet listed by the terminal
     # ------------------------------------------------------------------
     def commit_reservation(self, *, volume: float, magic: int = 0, risk: Optional[float] = None,
-                           request_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+                           request_id: Optional[str] = None, mt5=None) -> Tuple[Optional[str], Optional[str]]:
         """
         Evaluate the reservation-dependent limits again and reserve the order, atomically.
 
         Runs in one ``BEGIN IMMEDIATE`` transaction of the shared store, so two
         connections or processes cannot both use the last part of a budget:
         the second one sees the first one's reservation. It uses the listings
-        and losses prepared by the last :meth:`check_new_order` of this thread.
+        and losses prepared by the last :meth:`check_new_order` of this thread,
+        valid only while the reservation book keeps the version they were
+        reconciled with. If the book changed (for example another reader
+        released a reservation because the terminal now lists its position),
+        the listings are read again through ``mt5`` and the limits re-evaluated,
+        up to ``MAX_COMMIT_ATTEMPTS`` times; without ``mt5`` the order is rejected.
 
         Returns ``(reservation_id, None)`` or ``(None, error)``.
         """
         plan = getattr(self._plans, "current", None)
         self._plans.current = None
-        now = time.time()
-        with self._book().transaction() as db:
-            if plan is not None:
-                for scope in plan["scopes"]:
-                    reserved = self._reserved(db, plan["positions"], plan["orders"], magic=scope["magic"], now=now)
-                    error = self._evaluate_scope(scope, reserved, volume=float(volume), plan=plan)
-                    if error:
-                        return None, error
-            reservation_id = uuid.uuid4().hex
-            # Until the outcome is known the whole volume is reserved without ticket (counted as unlisted).
-            db.execute(
-                "INSERT INTO reservations(id, account_key, request_id, ticket, executed, working, magic, risk, status, created_at) "
-                "VALUES (?, ?, ?, NULL, ?, 0, ?, ?, 'pending', ?)",
-                (reservation_id, self._account_key, request_id, float(volume), int(magic or 0), risk, now),
-            )
-        return reservation_id, None
+        for _ in range(MAX_COMMIT_ATTEMPTS):
+            now = time.time()
+            with self._book().transaction() as db:
+                if plan is None or not plan["scopes"] or self._version(db) == plan["version"]:
+                    if plan is not None:
+                        for scope in plan["scopes"]:
+                            reserved = self._reserved(db, plan["positions"], plan["orders"], magic=scope["magic"], now=now)
+                            error = self._evaluate_scope(scope, reserved, volume=float(volume), plan=plan)
+                            if error:
+                                return None, error
+                    reservation_id = uuid.uuid4().hex
+                    # Until the outcome is known the whole volume is reserved without ticket (counted as unlisted).
+                    db.execute(
+                        "INSERT INTO reservations(id, account_key, request_id, ticket, executed, working, magic, risk, status, created_at) "
+                        "VALUES (?, ?, ?, NULL, ?, 0, ?, ?, 'pending', ?)",
+                        (reservation_id, self._account_key, request_id, float(volume), int(magic or 0), risk, now),
+                    )
+                    self._bump(db)
+                    return reservation_id, None
+            # The book changed since the listings were read: they may miss exposure the book no longer holds.
+            if mt5 is None:
+                return None, "Exposure changed while the order was being checked; send it again"
+            plan, error = self._plan(mt5, plan["scope_specs"], plan["order"])
+            if error:
+                return None, error
+        return None, (
+            f"Exposure kept changing while the order was being checked ({MAX_COMMIT_ATTEMPTS} attempts); "
+            "nothing was sent, send it again"
+        )
 
     def after_send(
         self,
@@ -798,7 +856,9 @@ class RiskGuard:
         book = self._book()
         if status not in ("done", "placed", "partial", "no_response"):
             if reservation_id:
-                book.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
+                with book.transaction() as db:
+                    db.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
+                    self._bump(db)
             return
         if duplicate_key is not None:
             self.record(duplicate_key)
@@ -819,17 +879,19 @@ class RiskGuard:
         else:  # no_response: no ticket, kept for the full TTL
             executed, working = volume, 0.0
 
-        if reservation_id:
-            book.execute(
-                "UPDATE reservations SET ticket = ?, executed = ?, working = ?, status = 'sent' WHERE id = ?",
-                (ticket, executed, working, reservation_id),
-            )
-        else:
-            book.execute(
-                "INSERT INTO reservations(id, account_key, request_id, ticket, executed, working, magic, risk, status, created_at) "
-                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'sent', ?)",
-                (uuid.uuid4().hex, self._account_key, ticket, executed, working, int(magic or 0), risk, time.time()),
-            )
+        with book.transaction() as db:
+            if reservation_id:
+                db.execute(
+                    "UPDATE reservations SET ticket = ?, executed = ?, working = ?, status = 'sent' WHERE id = ?",
+                    (ticket, executed, working, reservation_id),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO reservations(id, account_key, request_id, ticket, executed, working, magic, risk, status, created_at) "
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'sent', ?)",
+                    (uuid.uuid4().hex, self._account_key, ticket, executed, working, int(magic or 0), risk, time.time()),
+                )
+            self._bump(db)
 
     def reservations(self) -> List[_Reservation]:
         """Live reservations of the bound account (expired ones are dropped)."""

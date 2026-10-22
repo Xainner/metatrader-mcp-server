@@ -161,7 +161,7 @@ def _send_opening(
 		) if stop_loss else (None, None)
 		# Final check and reservation in one transaction shared by every connection and process.
 		reservation_id, error = guard.commit_reservation(
-			volume=request["volume"], magic=request["magic"], risk=risk, request_id=request_id
+			volume=request["volume"], magic=request["magic"], risk=risk, request_id=request_id, mt5=mt5
 		)
 		if error:
 			return _reject_locally(registry, request_id, error)
