@@ -1,6 +1,10 @@
+import MetaTrader5 as mt5
 from typing import Optional, Union
+from ..requests_registry import get_request_registry
 from ..types import TradeRequestActions
 from .send_order import send_order
+from ._build import pending_type_for
+from ._confirm import confirm_pending_opening
 from ._result import to_client_response
 from ..client_market import MT5Market
 
@@ -13,6 +17,9 @@ def place_pending_order(
 	price: Union[float, int],
 	stop_loss: Optional[Union[float, int]] = None,
 	take_profit: Optional[Union[float, int]] = None,
+	request_id: Optional[str] = None,
+	strategy_id: Optional[str] = None,
+	preview_id: Optional[str] = None,
 ):
 	"""
 	Places a pending order on the MetaTrader 5 platform.
@@ -31,10 +38,14 @@ def place_pending_order(
 		price: The price at which to place the pending order.
 		stop_loss: Optional stop loss level.
 		take_profit: Optional take profit level.
+		request_id: Stable ID of this intention; repeating it never sends a second order.
+		strategy_id: Strategy owning the order (magic number and strategy limits).
+		preview_id: ID returned by ``preview_order``; the order must match it.
 
 	Returns:
-		A dictionary with the result of the order placement. If successful,
-		it contains an order ID. Otherwise, it contains an error message.
+		A dictionary with the result of the order placement, the request
+		identity and, when the order was placed, ``verification`` and
+		``checks`` from re-reading the order in the terminal.
 	"""
 	
 	type = str(type).upper()
@@ -47,12 +58,8 @@ def place_pending_order(
 	if current_price is None:
 		return { "error": True, "message": f"Cannot get latest market price for {symbol}", "data": None }
 	
-	order_type = None
 	price = float(price)
-	if type == "BUY":
-		order_type = "BUY_LIMIT" if current_price["ask"] > price else "BUY_STOP"
-	else:
-		order_type = "SELL_LIMIT" if current_price["bid"] < price else "SELL_STOP"
+	order_type = pending_type_for(type, price, current_price["bid"], current_price["ask"])
 
 	response = send_order(
 		connection,
@@ -63,12 +70,24 @@ def place_pending_order(
 		price = price,
 		stop_loss = stop_loss,
 		take_profit = take_profit,
+		request_id = request_id,
+		strategy_id = strategy_id,
+		preview_id = preview_id,
 	)
 
-	if response["success"] is False:
-		return to_client_response(response)
+	if response["success"] is False or response.get("replayed"):
+		result = to_client_response(response)
+		if response.get("status") == "no_response":
+			result["verification"] = "unknown"
+		return result
 
-	return to_client_response(
+	result = to_client_response(
 		response,
 		f"Placed pending order {order_type} {symbol} {volume} LOT at {price} (Order ID: {response['data'].order}, {response['retcode_name']})",
 	)
+	result.update(confirm_pending_opening(mt5, response, symbol_info=mt5.symbol_info(symbol)))
+	if result["verification"] != "confirmed":
+		result["message"] += f"; verification {result['verification']} (see checks)"
+	if result.get("request_id"):
+		get_request_registry(connection).attach_result(result["request_id"], result)
+	return result

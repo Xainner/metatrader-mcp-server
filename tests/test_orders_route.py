@@ -51,8 +51,8 @@ def test_place_market_order_api_with_sl_tp(mock_mt5_client_order_methods): # Inj
         volume=0.01,
         type="BUY",
         stop_loss=1.0990,
-        take_profit=1.1010
-        # comment="custom_comment_test" # if this parameter were added
+        take_profit=1.1010,
+        request_id=None, strategy_id=None, preview_id=None,
     )
 
 def test_place_market_order_api_no_sl_tp(mock_mt5_client_order_methods): # Test without SL/TP
@@ -89,7 +89,8 @@ def test_place_market_order_api_no_sl_tp(mock_mt5_client_order_methods): # Test 
         volume=0.01,
         type="BUY",
         stop_loss=0.0, # Default SL value expected by place_market_order in routers/orders.py
-        take_profit=0.0  # Default TP value
+        take_profit=0.0,  # Default TP value
+        request_id=None, strategy_id=None, preview_id=None,
     )
 
 # Example for a test case with invalid input
@@ -132,7 +133,8 @@ def test_place_market_order_api_invalid_type(mock_mt5_client_order_methods):
         volume=0.01,
         type="INVALID_TYPE",
         stop_loss=1.0990,
-        take_profit=1.1010
+        take_profit=1.1010,
+        request_id=None, strategy_id=None, preview_id=None,
     )
 
 # Add more tests: e.g., missing required fields (FastAPI should catch this with 422)

@@ -73,6 +73,8 @@ def _isolate_from_terminal(request, monkeypatch):
 
     for name in CREDENTIAL_VARS:
         monkeypatch.delenv(name, raising=False)
+    # Durable state must not be written to the user's home directory by tests.
+    monkeypatch.setenv("MT5_STATE_DB", ":memory:")
 
     import MetaTrader5 as mt5
 

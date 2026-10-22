@@ -7,101 +7,166 @@ modification of positions and orders, and position closing.
 """
 
 import MetaTrader5 as mt5
-from typing import Optional, Union, Dict
+from typing import Optional, Union, Dict, Any
 from datetime import datetime
 
-from ..risk import get_risk_guard
+from ..metrics import metrics, timed
+from ..requests_registry import (
+	fingerprint,
+	get_request_registry,
+	new_request_id,
+	request_tag,
+	validate_request_id,
+)
+from ..risk import entries_block_reason, get_risk_guard
+from ..store import get_store
+from ..strategy import resolve_magic, validate_strategy_id
 from ..types import (
 	TradeRequestActions,
 	OrderType,
 	OrderFilling,
 	OrderTime
 )
-from ._result import interpret_order_result, failure
-from ._validation import (
-	is_buy,
-	select_filling_mode,
-	validate_volume,
-	normalize_price,
-	check_stops,
-	check_pending_price,
+from ._build import (
+	build_comment,
+	build_opening_request,
+	opening_params,
+	to_code as _to_code,
 )
-
-PENDING_TYPES = (
-	OrderType.BUY_LIMIT.value,
-	OrderType.SELL_LIMIT.value,
-	OrderType.BUY_STOP.value,
-	OrderType.SELL_STOP.value,
-)
-
-
-def _to_code(enum_cls, value) -> Optional[int]:
-	"""Convert an enum member, name or numeric code to its numeric code."""
-	if value is None:
-		return None
-	if isinstance(value, int) and not isinstance(value, bool):
-		return value if enum_cls.exists(value) else None
-	return enum_cls.validate(value)
-
-
-def _optional_level(value) -> Optional[float]:
-	"""Convert an optional SL/TP level, where None and 0 mean no level."""
-	if value is None:
-		return None
-	value = float(value)
-	return value if value != 0 else None
-
-
-def _load_symbol(symbol: Optional[str]):
-	"""Select a symbol and return (symbol_info, tick, error)."""
-	if not symbol:
-		return None, None, "Parameter `symbol` is required for this operation"
-	if not mt5.symbol_select(symbol, True):
-		return None, None, f"Invalid symbol or failed to select {symbol}"
-	symbol_info = mt5.symbol_info(symbol)
-	if symbol_info is None:
-		return None, None, f"Failed to get symbol info for {symbol}"
-	tick = mt5.symbol_info_tick(symbol)
-	if tick is None or not tick.bid or not tick.ask:
-		return symbol_info, None, f"No current quote for {symbol}"
-	return symbol_info, tick, None
-
-
-def _normalize_levels(symbol_info, stop_loss, take_profit):
-	"""Normalize optional SL/TP to the symbol precision. Returns (sl, tp, error)."""
-	levels = []
-	for label, value in (("Stop loss", stop_loss), ("Take profit", take_profit)):
-		value = _optional_level(value)
-		if value is not None:
-			value, error = normalize_price(symbol_info, value, label)
-			if error:
-				return None, None, error
-		levels.append(value)
-	return levels[0], levels[1], None
+from ._preview_store import get_preview_store
+from ._result import interpret_order_result, failure, replayed, STATUS_NO_RESPONSE
+from ._validation import select_filling_mode, normalize_price, validate_volume
 
 
 def _send(request: Dict) -> Dict:
-	"""Send a request and interpret its result."""
-	return interpret_order_result(mt5, mt5.order_send(request), request)
+	"""Send a request and interpret its result. An exception from the terminal means an unknown outcome."""
+	try:
+		result = mt5.order_send(request)
+	except Exception as exc:  # the request may or may not have reached the server
+		response = interpret_order_result(mt5, None, request)
+		response["message"] = (
+			f"order_send raised {type(exc).__name__}: {exc}. "
+			"The final state is unknown: check positions and orders before retrying."
+		)
+		return response
+	return interpret_order_result(mt5, result, request)
 
 
-def _send_opening(guard, request: Dict, *, symbol: str, side: int, stop_loss, duplicate_key) -> Dict:
+def _account_identity():
+	account = mt5.account_info()
+	if account is None:
+		return None, None
+	return getattr(account, "login", None), getattr(account, "server", None)
+
+
+def _begin(registry, request_id: Optional[str], request: Dict, *, kind: str, strategy_id, magic):
+	"""Register the intention; returns (request_id, early_response or None)."""
+	error = validate_request_id(request_id)
+	if error:
+		return request_id, failure(error)
+	login, server = _account_identity()
+	params = opening_params(request, strategy_id) if kind == "open" else {
+		"action": request["action"], "position": request.get("position"), "volume": request.get("volume"),
+		"type": request.get("type"), "symbol": request.get("symbol"),
+	}
+	begun = registry.begin(
+		request_id, params=params, kind=kind, account=login, server=server,
+		strategy_id=strategy_id, magic=magic, symbol=request.get("symbol"),
+	)
+	if begun["status"] == "conflict":
+		response = failure(
+			f"request_id {request_id} was already used for a different request "
+			f"(state {begun['record']['state']}); use a new request_id for a new operation"
+		)
+		response["request_id"] = request_id
+		response["request_state"] = begun["record"]["state"]
+		return request_id, response
+	if begun["status"] == "existing":
+		return request_id, replayed(begun["record"])
+	return request_id, None
+
+
+def _send_tracked(registry, request_id: str, request: Dict) -> Dict:
+	"""Mark the request as sending, send it and store the interpreted result."""
+	registry.mark(request_id, "sending")
+	with timed() as t:
+		response = _send(request)
+	metrics.record("broker_send", t.ms, ok=response["status"] != STATUS_NO_RESPONSE, error=None if response["status"] != STATUS_NO_RESPONSE else response["message"])
+	state = registry.record_send_result(request_id, response)
+	response["request_id"] = request_id
+	response["request_state"] = state
+	response["timings"] = {"send_ms": round(t.ms, 3)}
+	return response
+
+
+def _reject_locally(registry, request_id: str, error: str) -> Dict:
+	registry.mark(request_id, "rejected", detail=error, outcome="blocked_locally", message=error)
+	response = failure(error)
+	response["request_id"] = request_id
+	response["request_state"] = "rejected"
+	return response
+
+
+def _send_opening(
+	connection,
+	guard,
+	request: Dict,
+	*,
+	info: Dict[str, Any],
+	request_id: Optional[str],
+	strategy_id: Optional[str],
+	preview_id: Optional[str],
+	duplicate_key,
+) -> Dict:
 	"""
-	Check the risk limits, send an order that opens exposure and reserve it, atomically.
+	Register, check the risk limits, send an order that opens exposure and reserve it.
 
 	The guard lock is held from the first check until the reservation is stored,
 	so concurrent requests on the same connection cannot pass the checks with
-	the same budget or the same duplicate key.
+	the same budget or the same duplicate key. The request identity is stored
+	before any check (see ``metatrader_client.requests_registry``).
 	"""
+	registry = get_request_registry(connection)
+	request_id = request_id if request_id is not None else new_request_id()
+	request["comment"] = build_comment(request.get("comment"), request_tag(str(request_id)))
+	request_id, early = _begin(registry, request_id, request, kind="open", strategy_id=strategy_id, magic=request["magic"])
+	if early:
+		return early
+
+	symbol, side, stop_loss = request["symbol"], info["side"], info["stop_loss"]
 	with guard.opening():
-		error = guard.check_duplicate(duplicate_key) or guard.check_new_order(
-			mt5, symbol=symbol, side=side, volume=request["volume"], entry_price=request["price"], stop_loss=stop_loss
-		)
+		error = entries_block_reason(guard.config, get_store(connection))
+		if not error and guard.config.block_on_unresolved:
+			login, server = _account_identity()
+			pending = registry.unresolved(account=login, server=server, symbol=symbol, exclude=request_id)
+			if pending:
+				ids = ", ".join(r["request_id"] for r in pending)
+				error = (
+					f"Requests with an unknown outcome on {symbol}: {ids}. They may have been executed; "
+					"reconcile them (reconcile_request) or resolve them explicitly (resolve_request) before opening new exposure"
+				)
+		if not error:
+			error = get_preview_store(connection).consume(
+				preview_id, fingerprint=registry_fingerprint(request, strategy_id), entry_price=request["price"]
+			)
+		if not error:
+			error = guard.check_duplicate(duplicate_key) or guard.check_new_order(
+				mt5, symbol=symbol, side=side, volume=request["volume"], entry_price=request["price"],
+				stop_loss=stop_loss, magic=request["magic"], strategy_id=strategy_id,
+			)
 		if error:
-			return failure(error)
-		response = _send(request)
-		guard.after_send(response, duplicate_key, request["volume"])
+			return _reject_locally(registry, request_id, error)
+		risk, _ = guard.loss_at_stop(
+			mt5, symbol=symbol, side=side, volume=request["volume"], entry_price=request["price"], stop_loss=stop_loss
+		) if stop_loss else (None, None)
+		response = _send_tracked(registry, request_id, request)
+		guard.after_send(response, duplicate_key, request["volume"], magic=request["magic"], risk=risk)
 		return response
+
+
+def registry_fingerprint(request: Dict, strategy_id: Optional[str]) -> str:
+	"""Fingerprint of an opening request, shared with ``preview_order``."""
+	return fingerprint(opening_params(request, strategy_id))
 
 
 def send_order(
@@ -115,7 +180,7 @@ def send_order(
 	stop_loss: Optional[float] = None,
 	take_profit: Optional[float] = None,
 	deviation: Optional[int] = 20,
-	magic: Optional[int] = 0,
+	magic: Optional[int] = None,
 	comment: Optional[str] = "",
 	position: Optional[int] = None,
 	position_by: Optional[int] = None,
@@ -123,7 +188,10 @@ def send_order(
 	expiration: Optional[datetime] = None,
 	type_filling: Optional[Union[str, int, OrderFilling]] = None,
 	type_time: Optional[Union[str, int, OrderTime]] = None,
-	stoplimit: Optional[float] = None
+	stoplimit: Optional[float] = None,
+	request_id: Optional[str] = None,
+	strategy_id: Optional[str] = None,
+	preview_id: Optional[str] = None,
 ) -> Dict:
 	"""
 	Send a trading order to MetaTrader 5.
@@ -143,8 +211,8 @@ def send_order(
 		stop_loss: Stop Loss level. None or 0 means no stop loss
 		take_profit: Take Profit level. None or 0 means no take profit
 		deviation: Maximum acceptable price deviation in points (for market orders)
-		magic: Expert Advisor ID (magic number)
-		comment: Order comment
+		magic: Magic number; derived from ``strategy_id`` when omitted (0 without strategy)
+		comment: Order comment (the request tag is appended for openings)
 		position: Position ticket (required for SLTP, and to close a position with DEAL)
 		position_by: Opposite position ticket (for CLOSE_BY operations)
 		order: Order ticket (required for MODIFY and REMOVE)
@@ -152,6 +220,10 @@ def send_order(
 		type_filling: Order filling type; selected from the symbol settings when omitted
 		type_time: Order lifetime type (GTC, DAY, SPECIFIED, SPECIFIED_DAY)
 		stoplimit: Stop limit price (for STOP_LIMIT orders)
+		request_id: Stable ID of this trading intention (generated when omitted for openings).
+			Repeating it returns the recorded state instead of sending again.
+		strategy_id: Strategy that owns the order (sets the magic number and the strategy limits)
+		preview_id: ID returned by ``preview_order``; the order must match the preview
 
 	Returns:
 		Dictionary containing:
@@ -161,6 +233,8 @@ def send_order(
 		- 'message': Human-readable message describing the result
 		- 'data': Raw order_send result, None if the request was not sent
 		- 'request': The request that was sent
+		- 'request_id' / 'request_state': Request identity and registry state (tracked requests)
+		- 'replayed': True when the request_id was already recorded and nothing was sent
 
 	Notes:
 		Different parameters are required depending on the action:
@@ -178,130 +252,103 @@ def send_order(
 	comment = comment if comment else "MCP"
 	guard = get_risk_guard(connection)
 
+	error = validate_strategy_id(strategy_id)
+	if error:
+		return failure(error)
+	resolved_magic = resolve_magic(strategy_id, magic)
+	if resolved_magic is None:
+		return failure(f"magic {magic} does not match the magic number of strategy {strategy_id}")
+
 	error = guard.check_account(mt5)
 	if error:
 		return failure(error)
 
-	# ------------------------------
-	# Market execution (BUY or SELL)
-	# ------------------------------
-	if action == TradeRequestActions.DEAL.value:
+	closing = action == TradeRequestActions.DEAL.value and bool(position)
 
-		if order_type not in (OrderType.BUY.value, OrderType.SELL.value):
-			return failure("Invalid order type, must be BUY or SELL")
-		closing = bool(position)
-
-		symbol_info, tick, error = _load_symbol(symbol)
+	# ------------------------------------------------------------
+	# Orders that open exposure: market (BUY/SELL) and pending
+	# ------------------------------------------------------------
+	if action in (TradeRequestActions.DEAL.value, TradeRequestActions.PENDING.value) and not closing:
+		request, info, error = build_opening_request(
+			mt5,
+			action=action,
+			symbol=symbol,
+			volume=volume,
+			order_type=order_type,
+			price=price,
+			stop_loss=stop_loss,
+			take_profit=take_profit,
+			deviation=deviation,
+			magic=resolved_magic,
+			comment=comment,
+			expiration=expiration,
+			type_filling=type_filling,
+			type_time=type_time,
+		)
 		if error:
 			return failure(error)
+		if action == TradeRequestActions.DEAL.value:
+			duplicate_key = ("DEAL", symbol, order_type, request["volume"], info["stop_loss"], info["take_profit"], resolved_magic)
+		else:
+			duplicate_key = ("PENDING", symbol, order_type, request["volume"], request["price"], info["stop_loss"], info["take_profit"], resolved_magic)
+		return _send_opening(
+			connection, guard, request, info=info, request_id=request_id,
+			strategy_id=strategy_id, preview_id=preview_id, duplicate_key=duplicate_key,
+		)
 
+	# ---------------------------------
+	# Close a position with a DEAL order
+	# ---------------------------------
+	if closing:
+		if order_type not in (OrderType.BUY.value, OrderType.SELL.value):
+			return failure("Invalid order type, must be BUY or SELL")
+		if not symbol:
+			return failure("Parameter `symbol` is required for this operation")
+		if not mt5.symbol_select(symbol, True):
+			return failure(f"Invalid symbol or failed to select {symbol}")
+		symbol_info = mt5.symbol_info(symbol)
+		if symbol_info is None:
+			return failure(f"Failed to get symbol info for {symbol}")
+		tick = mt5.symbol_info_tick(symbol)
+		if tick is None or not tick.bid or not tick.ask:
+			return failure(f"No current quote for {symbol}")
 		volume, error = validate_volume(symbol_info, volume)
 		if error:
 			return failure(error)
-
-		# The quote is read before validating SL/TP, so they are compared with the real price.
 		if price:
 			price, error = normalize_price(symbol_info, price)
 			if error:
 				return failure(error)
 		else:
 			price = tick.ask if order_type == OrderType.BUY.value else tick.bid
-
-		stop_loss, take_profit, error = _normalize_levels(symbol_info, stop_loss, take_profit)
-		if error:
-			return failure(error)
-		if not closing:
-			# A new position is closed at bid (buy) or ask (sell): stops are measured from that price.
-			reference = tick.bid if order_type == OrderType.BUY.value else tick.ask
-			error = check_stops(symbol_info, order_type, reference_price=reference, stop_loss=stop_loss, take_profit=take_profit)
-			if error:
-				return failure(error)
-
 		filling = _to_code(OrderFilling, type_filling)
 		if filling is None:
 			filling, error = select_filling_mode(symbol_info, pending=False)
 			if error:
 				return failure(error)
-
 		request = {
 			"action": action,
 			"symbol": symbol,
 			"volume": volume,
 			"type": order_type,
 			"price": price,
-			"sl": stop_loss or 0.0,
-			"tp": take_profit or 0.0,
+			"sl": 0.0,
+			"tp": 0.0,
 			"deviation": int(deviation if deviation is not None else 20),
-			"magic": int(magic or 0),
+			"magic": int(resolved_magic or 0),
 			"comment": comment,
 			"type_time": OrderTime.GTC.value,
 			"type_filling": filling,
+			"position": int(position),
 		}
-		if closing:
-			request["position"] = int(position)
+		if request_id is None:
 			return _send(request)
-
-		duplicate_key = ("DEAL", symbol, order_type, volume, stop_loss, take_profit)
-		return _send_opening(guard, request, symbol=symbol, side=order_type, stop_loss=stop_loss, duplicate_key=duplicate_key)
-
-	# ----------------------------------------------------------
-	# Pending order (BUY_LIMIT, SELL_LIMIT, BUY_STOP, SELL_STOP)
-	# ----------------------------------------------------------
-	if action == TradeRequestActions.PENDING.value:
-
-		if order_type not in PENDING_TYPES:
-			return failure("Invalid order type, must be BUY_LIMIT, SELL_LIMIT, BUY_STOP, or SELL_STOP")
-
-		symbol_info, tick, error = _load_symbol(symbol)
-		if error:
-			return failure(error)
-
-		volume, error = validate_volume(symbol_info, volume)
-		if error:
-			return failure(error)
-
-		price, error = normalize_price(symbol_info, price)
-		if error:
-			return failure(error)
-		error = check_pending_price(symbol_info, order_type, price=price, bid=tick.bid, ask=tick.ask)
-		if error:
-			return failure(error)
-
-		stop_loss, take_profit, error = _normalize_levels(symbol_info, stop_loss, take_profit)
-		if error:
-			return failure(error)
-		error = check_stops(symbol_info, order_type, reference_price=price, stop_loss=stop_loss, take_profit=take_profit)
-		if error:
-			return failure(error)
-
-		filling = _to_code(OrderFilling, type_filling)
-		if filling is None:
-			filling, _ = select_filling_mode(symbol_info, pending=True)
-
-		lifetime = _to_code(OrderTime, type_time)
-		if lifetime is None:
-			lifetime = OrderTime.SPECIFIED.value if expiration else OrderTime.GTC.value
-
-		request = {
-			"action": action,
-			"symbol": symbol,
-			"volume": volume,
-			"type": order_type,
-			"price": price,
-			"sl": stop_loss or 0.0,
-			"tp": take_profit or 0.0,
-			"deviation": int(deviation if deviation is not None else 20),
-			"magic": int(magic or 0),
-			"comment": comment,
-			"type_time": lifetime,
-			"type_filling": filling,
-		}
-		if expiration:
-			request["expiration"] = expiration
-
-		side = OrderType.BUY.value if is_buy(order_type) else OrderType.SELL.value
-		duplicate_key = ("PENDING", symbol, order_type, volume, price, stop_loss, take_profit)
-		return _send_opening(guard, request, symbol=symbol, side=side, stop_loss=stop_loss, duplicate_key=duplicate_key)
+		registry = get_request_registry(connection)
+		request["comment"] = build_comment(comment, request_tag(request_id))
+		request_id, early = _begin(registry, request_id, request, kind="close", strategy_id=strategy_id, magic=request["magic"])
+		if early:
+			return early
+		return _send_tracked(registry, request_id, request)
 
 	# -----------------------
 	# Modify position (SL/TP)

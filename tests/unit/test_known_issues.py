@@ -281,7 +281,8 @@ def test_mt5_003_rejected_order_releases_its_reservation(fake_mt5, connection):
 
 
 def test_mt5_003_unknown_outcome_keeps_reservation_and_blocks_duplicate(fake_mt5, connection):
-    with_risk(connection, max_open_positions=1, duplicate_window_seconds=10)
+    # The request registry (IMP-004) would block both requests first; this test isolates the reservation layer.
+    with_risk(connection, max_open_positions=1, duplicate_window_seconds=10, block_on_unresolved=False)
     fake_mt5.results = [None]
 
     assert place_market_order(connection, type="BUY", symbol="EURUSD", volume=0.1)["status"] == "no_response"

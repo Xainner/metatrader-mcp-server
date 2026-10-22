@@ -93,6 +93,8 @@ def init(
 	password: Optional[str],
 	server: Optional[str],
 	path: Optional[str] = None,
+	*,
+	raise_on_failure: bool = True,
 ) -> Optional[client.MT5Client]:
 	"""
 	Initialize MT5Client
@@ -102,6 +104,9 @@ def init(
 		password (Optional[str]): Password
 		server (Optional[str]): Server name
 		path (Optional[str]): Path to MT5 terminal executable (default: None for auto-detect)
+		raise_on_failure (bool): Raise when the first connection fails (default). With False the
+			client is returned unconnected and the error is logged, so a caller with a
+			reconnection policy (the MCP bridge) can retry later.
 
 	Returns:
 		Optional[client.MT5Client]: MT5Client instance if all parameters are provided, None otherwise
@@ -119,7 +124,12 @@ def init(
 			config["path"] = path
 
 		mt5_client = client.MT5Client(config=config)
-		mt5_client.connect()
+		try:
+			mt5_client.connect()
+		except Exception as exc:
+			if raise_on_failure:
+				raise
+			logger.warning("Initial connection to MetaTrader 5 failed, will retry on demand: %s", exc)
 		return mt5_client
 
 	return None

@@ -18,10 +18,39 @@ max_risk_per_trade_pct          MT5_MAX_RISK_PER_TRADE_PCT          None
 require_stop_loss               MT5_REQUIRE_STOP_LOSS               False
 max_daily_loss                  MT5_MAX_DAILY_LOSS                  None
 duplicate_window_seconds        MT5_DUPLICATE_WINDOW_SECONDS        10
+allow_new_entries               MT5_ALLOW_NEW_ENTRIES               True
+block_on_unresolved             MT5_BLOCK_ON_UNRESOLVED             True
+max_entries_per_day             MT5_MAX_ENTRIES_PER_DAY             None
+max_aggregate_risk_pct          MT5_MAX_AGGREGATE_RISK_PCT          None
+strategy_limits                 MT5_STRATEGY_LIMITS (JSON)          None
+missing_protection_policy       MT5_MISSING_PROTECTION_POLICY       report
 ==============================  ==================================  ========
 
 ``None`` disables a limit. Trading is only allowed on demo accounts unless
-``allow_live_trading`` is explicitly enabled.
+``allow_live_trading`` is explicitly enabled. The values are chosen by the
+user; the defaults do not recommend a size or an acceptable loss.
+
+``strategy_limits`` maps a ``strategy_id`` to its own ``max_volume_per_order``,
+``max_total_volume``, ``max_open_positions``, ``max_daily_loss``,
+``max_entries_per_day`` and ``max_aggregate_risk_pct``. They are applied in
+addition to the account limits, to the positions, orders and reservations
+with the strategy magic number (see ``metatrader_client.strategy``).
+
+Aggregate risk rule (``max_aggregate_risk_pct``): the losses at the stop loss
+of every position (from its current price), pending order (from its price,
+as if it triggered), unlisted reservation and the new order are added
+without netting opposite exposure; a stop loss in the profitable direction
+contributes 0. Any item without stop loss makes the total unknown and the
+new order is blocked. Values are in the account currency, as computed by
+``order_calc_profit``; commissions and swaps are not included.
+
+Entries (``max_entries_per_day``): deals of the server day that opened or
+reversed a position, plus pending orders that may trigger, plus orders sent
+and not listed yet.
+
+Netting accounts hold one net position per symbol: the rules above are applied
+to that position as listed (its volume, current price and stop loss), without
+splitting it back into the orders that built it.
 
 When a limit needs terminal data that cannot be read (``positions_get``,
 ``orders_get`` or ``history_deals_get`` returning ``None``), new exposure is
@@ -44,6 +73,7 @@ not coordinate other processes, other connections, manual trading or other
 robots using the same account.
 """
 
+import json
 import logging
 import os
 import threading
@@ -62,6 +92,8 @@ ORDER_FILLING_IOC = 1
 _EPS = 1e-9
 DEAL_TYPE_BUY = 0
 DEAL_TYPE_SELL = 1
+DEAL_ENTRY_IN = 0
+DEAL_ENTRY_INOUT = 2
 
 _ENV_PREFIX = "MT5_"
 _TRUE = {"1", "true", "yes", "on"}
@@ -79,6 +111,34 @@ def _parse_bool(value: Any) -> bool:
     raise ValueError(f"Invalid boolean value {value!r}")
 
 
+_BOOL_SETTINGS = {"allow_live_trading", "require_stop_loss", "allow_new_entries", "block_on_unresolved"}
+_INT_SETTINGS = {"max_open_positions", "max_entries_per_day"}
+STRATEGY_LIMIT_KEYS = (
+    "max_volume_per_order",
+    "max_total_volume",
+    "max_open_positions",
+    "max_daily_loss",
+    "max_entries_per_day",
+    "max_aggregate_risk_pct",
+)
+PROTECTION_POLICIES = ("report", "retry_sltp", "close")
+
+
+def _parse_limits(name: str, raw: Mapping[str, Any]) -> Dict[str, Any]:
+    unknown = set(raw) - set(STRATEGY_LIMIT_KEYS)
+    if unknown:
+        raise ValueError(f"Unknown {name} settings: {', '.join(sorted(unknown))}")
+    parsed = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        value = int(value) if key in _INT_SETTINGS else float(value)
+        if value < 0:
+            raise ValueError(f"{name}.{key} must not be negative")
+        parsed[key] = value
+    return parsed
+
+
 @dataclass(frozen=True)
 class RiskConfig:
     allow_live_trading: bool = False
@@ -89,6 +149,12 @@ class RiskConfig:
     require_stop_loss: bool = False
     max_daily_loss: Optional[float] = None
     duplicate_window_seconds: float = 10.0
+    allow_new_entries: bool = True
+    block_on_unresolved: bool = True
+    max_entries_per_day: Optional[int] = None
+    max_aggregate_risk_pct: Optional[float] = None
+    strategy_limits: Optional[Mapping[str, Mapping[str, Any]]] = None
+    missing_protection_policy: str = "report"
 
     @classmethod
     def from_sources(cls, config: Optional[Mapping[str, Any]] = None, env: Optional[Mapping[str, str]] = None) -> "RiskConfig":
@@ -107,17 +173,39 @@ class RiskConfig:
                 raw = env_value if env_value not in (None, "") else None
             if raw is None:
                 continue
-            if field.type in (bool, "bool"):
+            if field.name in _BOOL_SETTINGS:
                 values[field.name] = _parse_bool(raw)
-            elif field.name == "max_open_positions":
+            elif field.name in _INT_SETTINGS:
                 values[field.name] = int(raw)
+            elif field.name == "strategy_limits":
+                raw = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(raw, Mapping):
+                    raise ValueError("strategy_limits must be a mapping of strategy_id to limits")
+                values[field.name] = {str(k): _parse_limits(f"strategy_limits.{k}", v) for k, v in raw.items()}
+            elif field.name == "missing_protection_policy":
+                policy = str(raw).strip().lower()
+                if policy not in PROTECTION_POLICIES:
+                    raise ValueError(f"missing_protection_policy must be one of {', '.join(PROTECTION_POLICIES)}")
+                values[field.name] = policy
             else:
                 values[field.name] = float(raw)
 
         for name, value in values.items():
-            if not isinstance(value, bool) and value < 0:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0:
                 raise ValueError(f"Risk setting {name} must not be negative")
         return cls(**values)
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Effective settings as a JSON-friendly dict (no secrets are part of the risk settings)."""
+        result = {f.name: getattr(self, f.name) for f in fields(self)}
+        result["strategy_limits"] = {k: dict(v) for k, v in (self.strategy_limits or {}).items()}
+        return result
+
+    def limits_for(self, strategy_id: Optional[str]) -> Dict[str, Any]:
+        """Limits configured for one strategy (empty when none)."""
+        if not strategy_id or not self.strategy_limits:
+            return {}
+        return dict(self.strategy_limits.get(strategy_id) or {})
 
 
 @dataclass
@@ -134,6 +222,8 @@ class _Reservation:
     executed: float
     working: float
     created: float
+    magic: int = 0
+    risk: Optional[float] = None
 
     def unlisted(self, positions, orders) -> Tuple[float, int]:
         """
@@ -224,53 +314,204 @@ class RiskGuard:
         volume: float,
         entry_price: float,
         stop_loss: Optional[float],
+        magic: Optional[int] = None,
+        strategy_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         Check the limits that apply to an order that opens new exposure.
+
+        Account limits always apply. When ``strategy_id`` has entries in
+        ``strategy_limits``, the same kinds of limits are applied again to the
+        positions, pending orders and reservations whose magic is ``magic``.
 
         Args:
             side: ``mt5.ORDER_TYPE_BUY`` (0) or ``mt5.ORDER_TYPE_SELL`` (1) direction of the order.
         """
         cfg = self.config
+        account_limits = {
+            "max_volume_per_order": cfg.max_volume_per_order,
+            "max_total_volume": cfg.max_total_volume,
+            "max_open_positions": cfg.max_open_positions,
+            "max_daily_loss": cfg.max_daily_loss,
+            "max_entries_per_day": cfg.max_entries_per_day,
+            "max_aggregate_risk_pct": cfg.max_aggregate_risk_pct,
+        }
+        scopes = [("account", account_limits, None)]
+        strategy_limits = cfg.limits_for(strategy_id)
+        if strategy_limits:
+            scopes.append((f"strategy {strategy_id}", strategy_limits, int(magic or 0)))
 
-        if cfg.max_volume_per_order is not None and volume > cfg.max_volume_per_order + 1e-9:
-            return f"Volume {volume} exceeds the per-order limit of {cfg.max_volume_per_order} lots"
+        new_order = {"symbol": symbol, "side": side, "volume": volume, "entry_price": entry_price, "stop_loss": stop_loss}
+        for label, limits, scope_magic in scopes:
+            error = self._check_scope(mt5, label=label, limits=limits, magic=scope_magic, new_order=new_order)
+            if error:
+                return error
 
-        if cfg.max_open_positions is not None or cfg.max_total_volume is not None:
+        return self.check_stop_loss_risk(
+            mt5, symbol=symbol, side=side, volume=volume, entry_price=entry_price, stop_loss=stop_loss
+        )
+
+    def _check_scope(self, mt5, *, label: str, limits: Mapping[str, Any], magic: Optional[int], new_order: Dict[str, Any]) -> Optional[str]:
+        """Apply one set of limits to the items of a scope (``magic`` None means the whole account)."""
+        volume = new_order["volume"]
+        prefix = "" if magic is None else f"[{label}] "
+
+        max_volume = limits.get("max_volume_per_order")
+        if max_volume is not None and volume > max_volume + 1e-9:
+            return f"{prefix}Volume {volume} exceeds the per-order limit of {max_volume} lots"
+
+        needs_listings = any(
+            limits.get(k) is not None
+            for k in ("max_total_volume", "max_open_positions", "max_entries_per_day", "max_aggregate_risk_pct")
+        )
+        positions = orders = None
+        reserved: List[Tuple[float, int, Optional[float]]] = []
+        if needs_listings:
             positions, error = _read(mt5, "positions_get")
             if error:
-                return f"Cannot verify exposure limits, new orders are blocked: {error}"
+                return f"{prefix}Cannot verify exposure limits, new orders are blocked: {error}"
             orders, error = _read(mt5, "orders_get")
             if error:
-                return f"Cannot verify exposure limits, new orders are blocked: {error}"
-            reserved = self._unlisted_reservations(positions, orders)
-            reserved_slots = sum(slots for _, slots in reserved)
+                return f"{prefix}Cannot verify exposure limits, new orders are blocked: {error}"
+            reserved = self._unlisted_reservations(positions, orders, magic=magic)
+            if magic is not None:
+                positions = tuple(p for p in positions if int(getattr(p, "magic", 0) or 0) == magic)
+                orders = tuple(o for o in orders if int(getattr(o, "magic", 0) or 0) == magic)
+
+        max_open = limits.get("max_open_positions")
+        if max_open is not None:
+            reserved_slots = sum(slots for _, slots, _ in reserved)
             open_count = len(positions) + len(orders) + reserved_slots
-            if cfg.max_open_positions is not None and open_count + 1 > cfg.max_open_positions:
+            if open_count + 1 > max_open:
                 return (
-                    f"Opening this order would exceed the limit of {cfg.max_open_positions} "
+                    f"{prefix}Opening this order would exceed the limit of {max_open} "
                     f"open positions and pending orders ({len(positions)} positions, {len(orders)} orders, "
                     f"{reserved_slots} recently sent and not listed yet)"
                 )
-            if cfg.max_total_volume is not None:
-                current = (
-                    sum(float(p.volume) for p in positions)
-                    + sum(float(o.volume_current) for o in orders)
-                    + sum(volume for volume, _ in reserved)
+
+        max_total = limits.get("max_total_volume")
+        if max_total is not None:
+            current = (
+                sum(float(p.volume) for p in positions)
+                + sum(float(o.volume_current) for o in orders)
+                + sum(v for v, _, _ in reserved)
+            )
+            if current + volume > max_total + 1e-9:
+                return (
+                    f"{prefix}Total exposure would be {round(current + volume, 8)} lots, "
+                    f"above the limit of {max_total} lots"
                 )
-                if current + volume > cfg.max_total_volume + 1e-9:
-                    return (
-                        f"Total exposure would be {round(current + volume, 8)} lots, "
-                        f"above the limit of {cfg.max_total_volume} lots"
-                    )
 
-        error = self.check_stop_loss_risk(
-            mt5, symbol=symbol, side=side, volume=volume, entry_price=entry_price, stop_loss=stop_loss
-        )
+        max_entries = limits.get("max_entries_per_day")
+        if max_entries is not None:
+            error = self._check_entries(mt5, limit=max_entries, orders=orders, reserved=reserved,
+                                        magic=magic, symbol=new_order["symbol"], prefix=prefix)
+            if error:
+                return error
+
+        max_aggregate = limits.get("max_aggregate_risk_pct")
+        if max_aggregate is not None:
+            error = self._check_aggregate_risk(mt5, limit=max_aggregate, positions=positions, orders=orders,
+                                               reserved=reserved, new_order=new_order, prefix=prefix)
+            if error:
+                return error
+
+        max_daily = limits.get("max_daily_loss")
+        if max_daily is not None:
+            error = self.check_daily_loss(mt5, symbol=new_order["symbol"], limit=max_daily, magic=magic)
+            if error:
+                return f"{prefix}{error}"
+        return None
+
+    def _check_entries(self, mt5, *, limit: int, orders, reserved, magic: Optional[int], symbol: str, prefix: str) -> Optional[str]:
+        """
+        Entries of the server day: deals that opened or reversed a position
+        today, plus pending orders that may still trigger, plus orders sent and
+        not listed yet. The new order counts as one more entry.
+        """
+        deals, error = self._today_deals(mt5, symbol)
         if error:
-            return error
+            return f"{prefix}Cannot verify the daily entries limit, new orders are blocked: {error}"
+        opened = [
+            d for d in deals
+            if int(getattr(d, "entry", DEAL_ENTRY_IN)) in (DEAL_ENTRY_IN, DEAL_ENTRY_INOUT)
+            and d.type in (DEAL_TYPE_BUY, DEAL_TYPE_SELL)
+            and (magic is None or int(getattr(d, "magic", 0) or 0) == magic)
+        ]
+        pending = len(orders)
+        unlisted = sum(1 for v, _, _ in reserved if v > _EPS)
+        total = len(opened) + pending + unlisted
+        if total + 1 > limit:
+            return (
+                f"{prefix}Daily entries limit of {limit} reached ({len(opened)} entries today, "
+                f"{pending} pending orders that may trigger, {unlisted} sent and not listed yet)"
+            )
+        return None
 
-        return self.check_daily_loss(mt5, symbol=symbol)
+    def _check_aggregate_risk(self, mt5, *, limit: float, positions, orders, reserved, new_order, prefix: str) -> Optional[str]:
+        """
+        Sum of the losses at the stop loss of every position, pending order,
+        unlisted reservation and the new order, as a percentage of equity.
+
+        Rules: each item contributes the loss from its current price (positions)
+        or order price (pending orders) to its stop loss; a stop loss beyond the
+        entry in the profitable direction contributes 0; opposite positions are
+        not netted; an item without stop loss makes the total unknown, which
+        blocks the order.
+        """
+        account = mt5.account_info()
+        if account is None:
+            return f"{prefix}Cannot read account information to check the aggregate risk"
+        equity = float(account.equity)
+        if equity <= 0:
+            return f"{prefix}Account equity is not positive"
+
+        total = 0.0
+        for p in positions:
+            if not p.sl:
+                return f"{prefix}Aggregate risk cannot be evaluated: position {p.ticket} has no stop loss"
+            price = float(getattr(p, "price_current", 0) or p.price_open)
+            loss, error = self.loss_at_stop(mt5, symbol=p.symbol, side=int(p.type), volume=float(p.volume), entry_price=price, stop_loss=p.sl)
+            if error:
+                return f"{prefix}Aggregate risk cannot be evaluated: {error}"
+            total += loss
+        for o in orders:
+            if not o.sl:
+                return f"{prefix}Aggregate risk cannot be evaluated: pending order {o.ticket} has no stop loss"
+            side = DEAL_TYPE_BUY if int(o.type) in (0, 2, 4, 6) else DEAL_TYPE_SELL
+            loss, error = self.loss_at_stop(mt5, symbol=o.symbol, side=side, volume=float(o.volume_current), entry_price=float(o.price_open), stop_loss=o.sl)
+            if error:
+                return f"{prefix}Aggregate risk cannot be evaluated: {error}"
+            total += loss
+        for volume, _, risk in reserved:
+            if volume <= _EPS:
+                continue
+            if risk is None:
+                return f"{prefix}Aggregate risk cannot be evaluated: an order sent without stop loss is not listed yet"
+            total += risk
+        if not new_order["stop_loss"]:
+            return f"{prefix}Aggregate risk cannot be evaluated: the new order has no stop loss"
+        loss, error = self.loss_at_stop(mt5, **new_order)
+        if error:
+            return f"{prefix}Aggregate risk cannot be evaluated: {error}"
+        total += loss
+        pct = total / equity * 100
+        if pct > limit + 1e-9:
+            return (
+                f"{prefix}Aggregate loss at stop losses would be {total:.2f} {account.currency} "
+                f"({pct:.2f}% of equity), above the limit of {limit}%"
+            )
+        return None
+
+    @staticmethod
+    def loss_at_stop(mt5, *, symbol: str, side: int, volume: float, entry_price: float, stop_loss: Optional[float]) -> Tuple[Optional[float], Optional[str]]:
+        """Loss (positive, account currency) if the price goes from ``entry_price`` to ``stop_loss``."""
+        if not stop_loss:
+            return None, "no stop loss"
+        loss = mt5.order_calc_profit(side, symbol, volume, entry_price, stop_loss)
+        if loss is None:
+            return None, f"cannot calculate the loss at the stop loss for {symbol}"
+        return abs(min(float(loss), 0.0)), None
 
     def check_stop_loss_risk(
         self,
@@ -308,45 +549,60 @@ class RiskGuard:
             )
         return None
 
-    def check_daily_loss(self, mt5, *, symbol: Optional[str] = None) -> Optional[str]:
-        """
-        Block new exposure once the loss of the current trading day reaches the limit.
-
-        The day starts at 00:00 of the trade server clock. The daily result is the
-        realized profit of today's deals (including commission, swap and fees)
-        plus the floating profit of open positions.
-        """
-        limit = self.config.max_daily_loss
-        if limit is None:
-            return None
-
+    @staticmethod
+    def _server_day(mt5, symbol: Optional[str]) -> Tuple[int, int]:
+        """(start of the server day, server now). The server clock is read from the last tick."""
         server_now = None
         if symbol:
             tick = mt5.symbol_info_tick(symbol)
             server_now = getattr(tick, "time", None) if tick is not None else None
         if not server_now:
             server_now = int(time.time())
-        day_start = int(server_now) - int(server_now) % 86400
+        return int(server_now) - int(server_now) % 86400, int(server_now)
 
+    def _today_deals(self, mt5, symbol: Optional[str]) -> Tuple[Optional[List[Any]], Optional[str]]:
+        """Deals of the current server day, or (None, error) when the history cannot be read."""
+        day_start, server_now = self._server_day(mt5, symbol)
         deals = mt5.history_deals_get(
             datetime.fromtimestamp(day_start - 86400, tz=timezone.utc),
-            datetime.fromtimestamp(int(server_now) + 86400, tz=timezone.utc),
+            datetime.fromtimestamp(server_now + 86400, tz=timezone.utc),
         )
         if deals is None:
             code, description = mt5.last_error()
-            return (
-                "Cannot verify the daily loss limit, new orders are blocked: "
-                f"history_deals_get failed (error {code}: {description})"
-            )
+            return None, f"history_deals_get failed (error {code}: {description})"
+        return [d for d in deals if d.time >= day_start], None
+
+    def check_daily_loss(self, mt5, *, symbol: Optional[str] = None, limit: Optional[float] = None,
+                         magic: Optional[int] = None) -> Optional[str]:
+        """
+        Block new exposure once the loss of the current trading day reaches the limit.
+
+        The day starts at 00:00 of the trade server clock. The daily result is the
+        realized profit of today's deals (including commission, swap and fees)
+        plus the floating profit of open positions. With ``magic``, only deals
+        and positions with that magic number count.
+        """
+        if limit is None:
+            limit = self.config.max_daily_loss
+        if limit is None:
+            return None
+
+        deals, error = self._today_deals(mt5, symbol)
+        if error:
+            return f"Cannot verify the daily loss limit, new orders are blocked: {error}"
         realized = sum(
             float(d.profit) + float(d.commission) + float(d.swap) + float(getattr(d, "fee", 0.0))
             for d in deals
-            if d.time >= day_start and d.type in (DEAL_TYPE_BUY, DEAL_TYPE_SELL)
+            if d.type in (DEAL_TYPE_BUY, DEAL_TYPE_SELL)
+            and (magic is None or int(getattr(d, "magic", 0) or 0) == magic)
         )
         positions, error = _read(mt5, "positions_get")
         if error:
             return f"Cannot verify the daily loss limit, new orders are blocked: {error}"
-        floating = sum(float(p.profit) + float(p.swap) for p in positions)
+        floating = sum(
+            float(p.profit) + float(p.swap) for p in positions
+            if magic is None or int(getattr(p, "magic", 0) or 0) == magic
+        )
         daily = realized + floating
         if daily <= -limit:
             return f"Daily loss limit reached: today's result is {daily:.2f}, limit is -{limit}"
@@ -379,7 +635,15 @@ class RiskGuard:
     # ------------------------------------------------------------------
     # Reservations of exposure sent but not yet listed by the terminal
     # ------------------------------------------------------------------
-    def after_send(self, response: Dict[str, Any], duplicate_key: Optional[Hashable], volume: float) -> None:
+    def after_send(
+        self,
+        response: Dict[str, Any],
+        duplicate_key: Optional[Hashable],
+        volume: float,
+        *,
+        magic: int = 0,
+        risk: Optional[float] = None,
+    ) -> None:
         """
         Apply the reservation policy to the outcome of an opening order.
 
@@ -417,18 +681,23 @@ class RiskGuard:
 
         with self._lock:
             self._reservations.append(
-                _Reservation(ticket=ticket, executed=executed, working=working, created=time.monotonic())
+                _Reservation(
+                    ticket=ticket, executed=executed, working=working, created=time.monotonic(),
+                    magic=int(magic or 0), risk=risk,
+                )
             )
 
-    def _unlisted_reservations(self, positions, orders) -> List[Tuple[float, int]]:
+    def _unlisted_reservations(self, positions, orders, *, magic: Optional[int] = None) -> List[Tuple[float, int, Optional[float]]]:
         """
         Reconcile reservations with the listings.
 
-        Returns the unlisted (volume, entries) of each reservation, and drops
-        reservations that expired or are fully listed.
+        Returns the unlisted (volume, entries, risk) of each reservation, and
+        drops reservations that expired or are fully listed. ``risk`` is the
+        loss at the stop loss of the unlisted part (None without stop loss).
+        With ``magic``, only reservations of that magic number are returned.
         """
         now = time.monotonic()
-        unlisted: List[Tuple[float, int]] = []
+        unlisted: List[Tuple[float, int, Optional[float]]] = []
         with self._lock:
             kept = []
             for reservation in self._reservations:
@@ -438,7 +707,13 @@ class RiskGuard:
                 if volume <= _EPS and slots == 0:
                     continue
                 kept.append(reservation)
-                unlisted.append((volume, slots))
+                if magic is not None and reservation.magic != magic:
+                    continue
+                committed = reservation.executed + reservation.working
+                risk = None
+                if reservation.risk is not None and committed > _EPS:
+                    risk = reservation.risk * min(1.0, volume / committed)
+                unlisted.append((volume, slots, risk))
             self._reservations = kept
         return unlisted
 
@@ -457,3 +732,35 @@ def get_risk_guard(connection) -> RiskGuard:
         if _default_guard is None:
             _default_guard = RiskGuard(RiskConfig.from_sources())
         return _default_guard
+
+
+# ----------------------------------------------------------------------
+# New entries switch
+# ----------------------------------------------------------------------
+ENTRIES_SETTING = "new_entries"
+
+
+def entries_block_reason(config: RiskConfig, store) -> Optional[str]:
+    """
+    Reason why new entries are disabled, or None.
+
+    New entries can be disabled by configuration (``allow_new_entries``) or at
+    runtime (:func:`set_new_entries`, stored durably). Closing positions,
+    cancelling orders and modifying stops stay available either way.
+    """
+    if not config.allow_new_entries:
+        return "New entries are disabled by configuration (MT5_ALLOW_NEW_ENTRIES=false); reducing exposure is still allowed"
+    setting = store.get_setting(ENTRIES_SETTING) if store is not None else None
+    if setting and not setting["value"].get("enabled", True):
+        reason = setting["value"].get("reason") or "no reason given"
+        return f"New entries are disabled ({reason}); reducing exposure is still allowed"
+    return None
+
+
+def set_new_entries(store, *, enabled: bool, reason: str, source: str) -> Dict[str, Any]:
+    """Enable or disable new entries at runtime; the change is kept in the settings log."""
+    if not reason or not str(reason).strip():
+        raise ValueError("A reason is required to change the new entries switch")
+    value = {"enabled": bool(enabled), "reason": str(reason).strip(), "source": source, "time": time.time()}
+    store.set_setting(ENTRIES_SETTING, value)
+    return value

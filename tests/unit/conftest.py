@@ -24,3 +24,18 @@ def fake_mt5(monkeypatch):
 def connection():
     """Connection stand-in carrying a risk guard with live trading blocked and no other limits."""
     return SimpleNamespace(risk_guard=RiskGuard(RiskConfig(duplicate_window_seconds=0)))
+
+
+@pytest.fixture(autouse=True)
+def _fresh_process_state():
+    """Process-wide fallbacks (store, previews, candle cache, metrics) start empty in every test."""
+    from metatrader_client.store import reset_default_store
+    from metatrader_client.order._preview_store import reset_default_preview_store
+    from metatrader_client.market.get_candles import candle_cache
+    from metatrader_client.metrics import metrics
+
+    reset_default_store()
+    reset_default_preview_store()
+    candle_cache.clear()
+    metrics.reset()
+    yield

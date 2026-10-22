@@ -10,6 +10,7 @@ from .client_order import MT5Order
 from .client_account import MT5Account
 from .client_market import MT5Market
 from .client_history import MT5History
+from .client_supervisor import MT5Supervisor
 
 class MT5Client:
     """
@@ -34,6 +35,7 @@ class MT5Client:
         self.market = MT5Market(self._connection)
         self.order = MT5Order(self._connection)
         self.history = MT5History(self._connection)
+        self.supervisor = MT5Supervisor(self._connection)
     
     # Connection methods
     
@@ -107,3 +109,8 @@ class MT5Client:
             Tuple[int, str]: Error code and description.
         """
         return self._connection.last_error()
+
+    @property
+    def connection(self):
+        """The underlying connection (risk guard, store, request registry)."""
+        return self._connection

@@ -5,6 +5,7 @@ from .history import router as history_router
 from .market import router as market_router
 from .orders import router as orders_router
 from .positions import router as positions_router
+from .rules import router as rules_router
 
 router = APIRouter()
 
@@ -15,3 +16,4 @@ router.include_router(history_router, prefix="/history", tags=["history"])
 router.include_router(market_router, prefix="/market", tags=["market"])
 router.include_router(orders_router, prefix="/order", tags=["orders"])
 router.include_router(positions_router, prefix="/positions", tags=["positions"])
+router.include_router(rules_router, prefix="/rules", tags=["rules"])

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime # Ensure datetime is imported
 # Removed unused import of pandas (pd)
@@ -201,5 +201,49 @@ async def filter_symbols(
         return client.market.get_symbols(group=group)
     except MT5ConnectionError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/specifications/{symbol_name}", response_model=Dict[str, Any])
+async def symbol_specifications(request: Request, symbol_name: str = Path(..., description="Broker symbol")):
+    """Broker specification of a symbol (contract, volumes, stops, modes, permissions)."""
+    client = request.app.state.client
+    try:
+        return client.market.get_symbol_specifications(symbol_name)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/candles", response_model=Dict[str, Any])
+async def candles(
+    request: Request,
+    symbol: str = Query(..., description="Symbol name"),
+    timeframe: str = Query(..., description="M1, M5, H1, ..."),
+    count: int = Query(100, description="Most recent bars (ignored with since)"),
+    since: Optional[str] = Query(None, description="next_since of a previous response, or ISO 8601"),
+    closed_only: bool = Query(False, description="Exclude the forming bar"),
+    limit: Optional[int] = Query(None, description="Maximum bars for since queries"),
+):
+    """Structured candles (schema candles/v1): ascending, closed flag, time basis, gaps, incremental queries."""
+    client = request.app.state.client
+    try:
+        return client.market.get_candles(symbol=symbol, timeframe=timeframe, count=count, since=since, closed_only=closed_only, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/candles/multi", response_model=Dict[str, Any])
+async def candles_multi(
+    request: Request,
+    symbol: str = Query(..., description="Symbol name"),
+    timeframes: List[str] = Query(..., description="Repeat the parameter: timeframes=M1&timeframes=H4"),
+    count: int = Query(100),
+    closed_only: bool = Query(False),
+):
+    """Candles of several timeframes, with a result or an error per timeframe."""
+    client = request.app.state.client
+    try:
+        return client.market.get_candles_multi(symbol=symbol, timeframes=timeframes, count=count, closed_only=closed_only)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

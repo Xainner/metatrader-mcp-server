@@ -2,7 +2,36 @@
 Helpers for operations applied to several positions or orders at once.
 """
 
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+from ..strategy import SCOPES, filter_scope, ownership, strategy_magic, validate_strategy_id
+
+
+def resolve_scope(scope: Optional[str], strategy_id: Optional[str]) -> Tuple[Optional[int], Optional[str]]:
+    """Magic number for a bulk scope; returns (magic, error)."""
+    if scope is not None and scope not in SCOPES:
+        return None, f"Invalid scope {scope!r}, must be one of {', '.join(SCOPES)}"
+    error = validate_strategy_id(strategy_id)
+    if error:
+        return None, error
+    if scope == "strategy" and not strategy_id:
+        return None, "scope 'strategy' requires strategy_id"
+    if strategy_id and scope not in (None, "strategy"):
+        return None, "strategy_id can only be combined with scope 'strategy'"
+    return (strategy_magic(strategy_id) if strategy_id else None), None
+
+
+def describe(item, magic: Optional[int]) -> Dict:
+    """Summary of a position or order for bulk previews."""
+    return {
+        "id": int(item.ticket),
+        "symbol": getattr(item, "symbol", None),
+        "type": getattr(item, "type", None),
+        "volume": getattr(item, "volume", None) if hasattr(item, "volume") else getattr(item, "volume_current", None),
+        "magic": int(getattr(item, "magic", 0) or 0),
+        "ownership": ownership(item, magic),
+        "profit": getattr(item, "profit", None),
+    }
 
 
 def run_bulk(
@@ -13,6 +42,9 @@ def run_bulk(
     verb: str,
     noun: str,
     error: Callable[[], object] = lambda: None,
+    scope: Optional[str] = None,
+    strategy_id: Optional[str] = None,
+    dry_run: bool = False,
 ) -> Dict:
     """
     Apply ``operation`` to every item, then check which ones are still present.
@@ -25,6 +57,10 @@ def run_bulk(
         verb: Past-tense verb for messages (e.g. "Closed").
         noun: Plural noun for messages (e.g. "positions").
         error: Function returning the last terminal error, used in messages.
+        scope: ``strategy`` (items with the strategy magic), ``manual`` (magic 0)
+            or ``all``. None keeps the library behaviour (all items).
+        strategy_id: Strategy for ``scope='strategy'``.
+        dry_run: Only list the items that would be processed; nothing is sent.
 
     Returns:
         dict: ``error`` is True when any item failed or is still present. ``data``
@@ -32,9 +68,23 @@ def run_bulk(
         ``unverified`` (final state unknown), ``remaining`` (None if the final
         listing failed) and ``total``.
     """
+    magic, scope_error = resolve_scope(scope, strategy_id)
+    if scope_error:
+        return {"error": True, "message": scope_error, "data": None}
     if items is None:
         return {"error": True, "message": f"Cannot read {noun} from the terminal: {error()}", "data": None}
+    items = filter_scope(items, scope=scope, magic=magic)
     targets = tickets(items)
+    scope_label = scope or "all"
+    if dry_run:
+        return {
+            "error": False,
+            "message": f"Dry run: {len(targets)} {noun} in scope '{scope_label}' would be processed; nothing was sent",
+            "data": {"dry_run": True, "scope": scope_label, "strategy_id": strategy_id, "total": len(targets),
+                     "items": [describe(item, magic) for item in items]},
+        }
+    present_all = list_present
+    list_present = lambda: filter_scope(present_all(), scope=scope, magic=magic)
     results: List[Dict] = []
     for ticket in targets:
         try:
@@ -84,6 +134,7 @@ def run_bulk(
         "error": has_error,
         "message": message,
         "data": {
+            "scope": scope_label,
             "total": len(targets),
             "succeeded": succeeded,
             "failed": failed,
