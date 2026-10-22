@@ -13,6 +13,7 @@ let state = 'starting', qr = null, qrAt = 0, client = null, groups = [], lastErr
 const status = () => ({state, source_id:initial.source_id, enabled:readConfig().enabled,
   authorized_groups:readConfig().allowed_group_ids.length, stored_events:store.count(),
   qr_available:!!qr && Date.now()-qrAt < 45000, last_error:lastError,
+  qr_version:qrAt, receiver_ready:!!client,
   execution_authorized:false, as_of:new Date().toISOString()});
 const fail = code => { lastError=code; console.error(code); };
 setInterval(() => {
@@ -44,10 +45,10 @@ http.createServer(async (req,res) => {
     if (req.url !== '/') { res.writeHead(404); return res.end(); }
     res.setHeader('Content-Type','text/html; charset=utf-8');
     res.end(`<!doctype html><html lang="es"><meta charset="utf-8"><title>Rinari · WhatsApp</title>
-      <style>body{font:18px system-ui;max-width:760px;margin:40px auto;background:#101920;color:#edf8f4;padding:20px}img{width:320px;max-width:100%;background:white}pre{white-space:pre-wrap}h1{color:#80e8bc}</style>
+      <style>body{font:18px system-ui;max-width:760px;margin:40px auto;background:#101920;color:#edf8f4;padding:20px}img{width:456px;max-width:calc(100% - 48px);background:white;padding:24px;image-rendering:pixelated}pre{white-space:pre-wrap}h1{color:#80e8bc}</style>
       <h1>WhatsApp · Señales para Rinari</h1><p>En tu teléfono: WhatsApp → Dispositivos vinculados → Vincular dispositivo. Escanea el QR.</p>
       <img id="qr" alt="Esperando código QR"><pre id="state"></pre><h2>Grupos disponibles</h2><p>Indica al agente el grupo exacto que autorizas. El receptor solo guarda mensajes de su lista permitida.</p><pre id="groups"></pre>
-      <script>async function refresh(){const s=await(await fetch('/status')).json();document.getElementById('state').textContent=JSON.stringify(s,null,2);const q=document.getElementById('qr');q.hidden=!s.qr_available;if(s.qr_available)q.src='/qr.png?t='+Date.now();document.getElementById('groups').textContent=JSON.stringify(await(await fetch('/groups')).json(),null,2);}setInterval(refresh,5000);refresh();</script></html>`);
+      <script>let version=0;async function refresh(){const s=await(await fetch('/status')).json();document.getElementById('state').textContent=JSON.stringify(s,null,2);const q=document.getElementById('qr');q.hidden=!s.qr_available;if(s.qr_available&&version!==s.qr_version){q.src='/qr.png?t='+s.qr_version;version=s.qr_version;}document.getElementById('groups').textContent=JSON.stringify(await(await fetch('/groups')).json(),null,2);}setInterval(refresh,2000);refresh();</script></html>`);
   } catch { res.writeHead(503); res.end('Receiver unavailable'); }
 }).listen(3000,'0.0.0.0');
 
