@@ -276,9 +276,15 @@ La revisión del head `593b9b2` encontró otro P1. La comprobación final reutil
 
 - [x] Cada libro de reservas (cuenta y servidor) tiene una versión (`reservation_versions`, migración 4) que sube con cada reserva guardada, actualizada, liberada por reconciliación o vencida. El plan guarda la versión con la que se reconciliaron sus posiciones. Si al hacer el commit la versión cambió, las posiciones se vuelven a leer y los límites se reevalúan, hasta `MAX_COMMIT_ATTEMPTS` (3) veces; si la versión sigue cambiando, la orden se rechaza sin enviarse. Pruebas en `tests/unit/test_review_r2_extra.py`: la reproducción del revisor, el rechazo con la razón real (21 frente al límite de 15), la reevaluación que sí envía cuando queda margen, el rechazo tras intentos acotados y el aumento de versión al vencer una reserva.
 
+### Tercera revisión del PR #3
+
+En el head `4b0cf6e` la versión del libro se tomaba después de leer posiciones y órdenes en MT5. Por eso podía asociar una lectura antigua a la versión que ya incluía el borrado de otra reserva: lectura A sin posiciones → envío, publicación y reconciliación de B → A toma la versión nueva y confirma sin volver a leer.
+
+- [x] Ahora la versión se toma **antes** de leer el terminal. Al reconciliar, el plan solo sigue siendo válido si el libro conserva esa versión; si no, queda marcado como obsoleto (`STALE_VERSION`) y el commit vuelve a leerlo todo, con intentos acotados. Los cambios que hace la propia reconciliación del plan se siguen, así que no provocan relecturas innecesarias. Pruebas en `tests/unit/test_review_r3_extra.py`: la reproducción del revisor, un cambio durante la lectura de órdenes, un cambio durante la lectura de revalidación y la comprobación de que la reconciliación propia no fuerza una relectura.
+
 ### Evidencia de esta implementación
 
-- `pytest`: 259 pruebas aprobadas y 39 de integración omitidas tras la segunda revisión (254 tras la primera, 245 en el head revisado al inicio, 146 antes del plan). Las pruebas nuevas están en `tests/unit/test_imp001_bridge.py`, `test_imp002_003_snapshot_preview.py`, `test_imp004_requests.py`, `test_imp005_006_execution_limits.py` y `test_imp007_008_supervisor_candles.py`.
+- `pytest`: 263 pruebas aprobadas y 39 de integración omitidas tras la tercera revisión (259 tras la segunda, 254 tras la primera, 245 en el head inicial, 146 antes del plan). Las pruebas nuevas están en `tests/unit/test_imp001_bridge.py`, `test_imp002_003_snapshot_preview.py`, `test_imp004_requests.py`, `test_imp005_006_execution_limits.py` y `test_imp007_008_supervisor_candles.py`.
 - Pruebas existentes ajustadas al contrato nuevo: número y esquemas de herramientas MCP, argumentos de identidad reenviados por MCP y REST, y la prueba de reservas MT5-003 con resultado desconocido, que ahora desactiva `block_on_unresolved` para aislar la capa de reservas (con el bloqueo activo, la segunda orden se rechaza antes).
 - `FakeMT5` aplica ahora las modificaciones SLTP/MODIFY aceptadas (la verificación nueva detectaba, correctamente, que antes no lo hacía) y simula `order_check`, `order_calc_margin`, historial de órdenes y velas.
 - Arranque real por STDIO sin credenciales: `initialize`, `tools/list` (45 herramientas) y `get_bridge_health` responden; el log se escribe en el archivo configurado.
