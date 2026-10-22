@@ -51,11 +51,34 @@ class ResearchTests(unittest.TestCase):
             candles[tf] = [{'ts': last - seconds * (159-i), 'open': 2500+i*.1, 'high': 2501+i*.1, 'low': 2499+i*.1, 'close': 2500.2+i*.1} for i in range(160)]
         result = self.research.analyze({'symbol': 'XAUUSDm', 'captured_at': now, 'tick': {'bid': 2516, 'ask': 2516.2, 'time': now}, 'candles': candles}, now=now)
         self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['source'], 'caller_supplied_unverified')
         self.assertEqual(result['data_quality']['closed_bar_counts']['M5'], 159)
         self.assertIn('h4_bias', result['analysis'])
         expected_macd = self.research.indicators.compute_macd_hist([row['close'] for row in candles['M5'][:-1]])
         self.assertEqual(result['analysis']['macd_hist_m5'], expected_macd[1])
         self.assertFalse(result['execution_authorized'])
+
+    def test_capture_contract_errors_are_not_misreported_as_stale(self):
+        now = time.time()
+        for captured in (None, 0, now*1000, str(now), float('nan'), True):
+            context = {'symbol': 'XAUUSDm'}
+            if captured is not None:
+                context['captured_at'] = captured
+            with self.subTest(captured=captured), self.assertRaises(ValueError):
+                self.research.analyze(context, now=now)
+
+    def test_stale_capture_and_tick_report_distinct_reasons(self):
+        now = time.time()
+        captured = self.research.analyze({'symbol': 'XAUUSDm', 'captured_at': now-61}, now=now)
+        self.assertEqual(captured['reason'], 'capture_too_old')
+        self.assertEqual(captured['data_quality']['capture_age_seconds'], 61)
+        for age, reason in [(45, 'quote_too_old'), (-20, 'quote_in_future')]:
+            result = self.research.analyze({'symbol':'XAUUSDm', 'captured_at':now,
+                'tick':{'bid':2500,'ask':2501,'time':now-age},'candles':{}}, now=now)
+            self.assertEqual(result['status'], 'data_stale')
+            self.assertEqual(result['reason'], reason)
+            self.assertEqual(result['tick_age_seconds'], age)
+            self.assertEqual(result['candidates'], [])
         self.assertFalse(any(name.startswith(('MetaTrader5', 'backend.src.remote', 'backend.src.core.engine')) for name in sys.modules))
 
     def test_stale_quote_does_not_produce_executable_candidates(self):

@@ -2,6 +2,14 @@
 
 Conectores: `gold-research`, `trading-signals` y `metatrader-demo`. Usar los nombres exactos de herramientas descubiertos por Rinari; no asumir que otros contratos del estudio ya están implementados.
 
+## Análisis de mercado y frescura
+
+Para datos actuales usar **`metatrader-demo.get_gold_research()`**: captura tick y M1/M5/M15/H1/H4 de MT5 y llama al analizador por SSH. No requiere preparar formatos de datos ni un feed interno en Linux. `status: ok` con `candidates: []` significa análisis completado sin patrón elegible; no equivale a `data_stale`.
+
+`gold-research.analyze_gold_market(context)` también admite datos del caller. Pasar la salida de `metatrader-demo.get_market_context()` sin cambiar su estructura ni tiempos. Contrato: `symbol: XAUUSDm`, `captured_at` como Unix **segundos UTC**, `tick: {bid, ask, time}` y `candles` con claves `M1/M5/M15/H1/H4`, arrays ordenados de `{ts,open,high,low,close}` incluyendo la vela en formación. Los tiempos originales de tick y barras deben usar la misma convención MT5; no reemplazar `tick.time` por el reloj del agente.
+
+Frescura: captura hasta 60 s; tick hasta 30 s tras medir offset del bróker. Ausencia de `captured_at`, milisegundos, ISO o valores inválidos son errores de contrato, no datos viejos. `data_stale.reason` distingue `capture_too_old`, `quote_too_old` y `quote_in_future`; `data_quality` muestra edades/umbrales. `clock_unknown` señala un offset no resoluble o inconsistente. Recapturar cuando corresponda; nunca retocar tiempos para forzar un resultado ni relajar los límites por falta de candidatos.
+
 ## Agente de señales y condiciones
 
 1. Consultar `gold-research.get_research_status` y `peek_signal_digest(consumer_id="rinari-gold")`.

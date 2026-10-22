@@ -106,11 +106,20 @@ class Research:
                   'source': context.get('source', 'caller_supplied_unverified'),
                   'news_status': 'not_configured', 'ml_model_status': 'not_used',
                   'parameter_basis': 'upstream_published_defaults_not_account_calibrated'}
-        captured = float(context.get('captured_at', 0))
-        if not math.isfinite(captured) or captured > now + 5:
-            raise ValueError('Invalid capture timestamp')
+        if 'captured_at' not in context:
+            raise ValueError('Missing context.captured_at: provide the actual capture time as numeric Unix seconds UTC. For live MT5 use metatrader-demo.get_gold_research(); no internal feed is required.')
+        captured = context['captured_at']
+        if isinstance(captured, bool) or not isinstance(captured, (int, float)) or not math.isfinite(captured) or captured <= 0:
+            raise ValueError('context.captured_at must be positive finite numeric Unix seconds UTC, not an ISO string')
+        if captured >= 100_000_000_000:
+            raise ValueError('context.captured_at uses milliseconds; numeric Unix seconds UTC are required. Do not change the original capture time to bypass freshness.')
+        if captured > now + 5:
+            raise ValueError('context.captured_at is in the future; check caller/server clocks and timestamp units')
+        result['data_quality'] = {'capture_age_seconds': now-captured, 'max_capture_age_seconds': 60,
+                                  'max_tick_age_seconds': 30, 'timestamp_unit': 'unix_seconds'}
         if now - captured > 60:
-            return {**result, 'status': 'data_stale'}
+            return {**result, 'status': 'data_stale', 'reason': 'capture_too_old',
+                    'next_step': 'Recapture MT5 data with metatrader-demo.get_gold_research(); do not restamp old data'}
         raw = context.get('candles', {})
         bars = {}
         for tf, values in raw.items():
@@ -132,12 +141,18 @@ class Research:
         bid, ask, stamp = (float(quote.get(key, 0)) for key in ('bid', 'ask', 'time'))
         if not all(math.isfinite(value) for value in (bid, ask, stamp)) or bid <= 0 or ask < bid:
             raise ValueError('Invalid quote')
+        if not math.isfinite(stamp) or stamp <= 0 or stamp >= 100_000_000_000:
+            raise ValueError('context.tick.time must be the original tick timestamp in numeric Unix seconds, not milliseconds or the caller capture time')
         offset = self.clock.measured_offset_s(SimpleNamespace(timestamp=stamp), bars.get('M1', []), now)
         if offset is None:
-            return {**result, 'status': 'clock_unknown'}
+            return {**result, 'status': 'clock_unknown', 'reason': 'broker_clock_unresolved_or_inconsistent',
+                    'next_step': 'Provide original MT5 tick.time and M1 candle ts from the same capture; do not mix clock conventions'}
         tick_age = now - (stamp - offset)
         if tick_age > 30 or tick_age < -5:
-            return {**result, 'status': 'data_stale', 'tick_age_seconds': tick_age}
+            return {**result, 'status': 'data_stale', 'reason': 'quote_too_old' if tick_age > 30 else 'quote_in_future',
+                    'tick_age_seconds': tick_age,
+                    'data_quality': {**result['data_quality'], 'tick_age_seconds': tick_age, 'broker_offset_seconds': offset},
+                    'next_step': 'Read a new actual MT5 tick and candles; check terminal connectivity/session and clock if the tick does not advance'}
         closed = {tf: self.clock.utc_closed(rows, PERIODS[tf], offset, now) for tf, rows in bars.items()}
         quality = {'broker_offset_seconds': offset, 'tick_age_seconds': tick_age,
                    'closed_bar_counts': {tf: len(rows) for tf, rows in closed.items()},

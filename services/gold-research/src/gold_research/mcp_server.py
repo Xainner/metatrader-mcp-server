@@ -35,7 +35,18 @@ def serve(home=None):
 
     @server.tool(annotations=read)
     def analyze_gold_market(context: dict) -> dict:
-        """Analyze provided MT5 OHLC/tick context; caller data is not broker verification."""
+        """Analyze caller-supplied data; no internal market feed exists here.
+
+        For live trading prefer metatrader-demo.get_gold_research(), which captures
+        MT5 directly. Or pass get_market_context() output unchanged: symbol XAUUSDm,
+        captured_at numeric Unix seconds UTC, tick {bid, ask, time}, candles mapping
+        M1/M5/M15/H1/H4 to ordered {ts, open, high, low, close} arrays including
+        forming bars. tick.time and candle ts retain the original MT5 clock.
+        Maximum capture age 60s, tick age 30s after broker offset measurement.
+        Missing/incorrect timestamps are input errors; data_stale includes reason.
+        Never replace old timestamps with current time to bypass these checks.
+        Caller-provided source labels do not verify broker provenance.
+        """
         return research.analyze(context)
 
     @server.tool(annotations=read)
