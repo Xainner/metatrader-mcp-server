@@ -63,6 +63,17 @@ class ResearchTests(unittest.TestCase):
         self.assertEqual(result['status'], 'data_stale')
         self.assertEqual(result['candidates'], [])
 
+    def test_upstream_generator_can_find_a_real_pattern_and_reject_continuation(self):
+        def candle(opening, close, low=None):
+            return {'open': opening, 'high': max(opening, close)+.2,
+                    'low': min(opening, close)-.2 if low is None else low, 'close': close}
+        levels = [{'price': 100, 'type': 'resistance', 'strength': 2}]
+        valid = [candle(98, 98) for _ in range(6)]+[candle(99, 106), candle(106, 106, 105), candle(100.1, 101, 99.8)]
+        continuation = [candle(105, 106, 104) for _ in range(7)]+[candle(104, 110), candle(100.1, 101, 99.8)]
+        detect = self.research.generators['check_breakout_retest']
+        self.assertEqual(detect(valid, levels, 'bullish', 'bullish', 101, 10, 30, 1)['breakout_type'], 'retest')
+        self.assertIsNone(detect(continuation, levels, 'bullish', 'bullish', 101, 10, 30, 1))
+
 
 class InboxTests(unittest.TestCase):
     def test_acknowledges_only_requested_events_and_preserves_revisions(self):
