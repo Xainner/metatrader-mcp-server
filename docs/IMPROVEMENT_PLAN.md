@@ -186,6 +186,7 @@ Usar parámetros del símbolo concreto del bróker; no asumir especificaciones g
 - Operaciones masivas: `scope` (`strategy`, `manual`, `all`) obligatorio en MCP, `dry_run` lista los tickets afectados sin enviar.
 - Interruptor de nuevas entradas: `MT5_ALLOW_NEW_ENTRIES` (configuración) y `disable_new_entries(reason)` (persistente). Cerrar, cancelar y modificar stops siguen disponibles. Reactivar no se expone como herramienta MCP: queda para el operador (`MT5Order.enable_new_entries`, REST `POST /order/entries/enable`).
 - Cierres hechos por el servidor usan el magic de la posición, para que la pérdida diaria por estrategia incluya sus cierres.
+- Reservas compartidas: las reservas de exposición viven en la tabla `reservations` del Store (migración 3), por cuenta y servidor. Antes de `order_send`, los límites que dependen de reservas (posiciones abiertas, volumen total, entradas del día y riesgo agregado) se vuelven a evaluar y la reserva se inserta en una única transacción `BEGIN IMMEDIATE`, así que dos conexiones o procesos que comparten la base no pueden usar la misma parte del presupuesto. La reserva cubre el envío pendiente, el resultado incierto (durante el TTL) y la publicación tardía. No coordina procesos con otra base, la operativa manual ni otros robots.
 
 ## IMP-007 — Supervisor local de posiciones
 
@@ -204,11 +205,11 @@ Usar parámetros del símbolo concreto del bróker; no asumir especificaciones g
 - [x] Dos ciclos o procesos no duplican el cierre de la misma regla (arrendamiento en la base compartida + compare-and-set + `request_id` estable por cierre: `test_two_supervisors_never_close_twice`, `test_second_owner_waits_for_the_lease`).
 - [x] Reinicio, fill parcial o resultado desconocido no provocan reintentos ciegos (`test_interrupted_rule_is_not_retried_after_a_restart`, `test_partial_close_is_pending_reconciliation`, `test_uncertain_or_rejected_close_is_not_retried`).
 - [x] Un dato de P&L obsoleto o ilegible no se sustituye por una cotización externa (`test_stale_or_unreadable_pnl_is_not_evaluated`).
-- [x] Registrar umbral observado, hora, acción y resultado final; distinguir P&L flotante del neto realizado (`result.observed`, `results[].floating_pnl_at_trigger`, `results[].realized_net`).
+- [x] Registrar umbral observado, hora, acción y resultado final; distinguir P&L flotante del neto realizado (`result.observed`, `results[].floating_pnl_at_trigger`, `results[].realized_net_close` y `results[].realized_net_position`).
 
 ### Implementación
 
-`metatrader_client/supervisor.py`, herramientas `create_position_rule`, `list_position_rules`, `pause_position_rule`, `resume_position_rule`, `remove_position_rule` (REST `/api/v1/rules`). Reglas por ticket o por estrategia (opcionalmente un símbolo), métrica `pnl` (beneficio + swap) o `profit`, operador `>=`/`<=`, acción `close`. Estados: `active`, `paused`, `triggered`, `executing`, `fulfilled`, `failed`, `pending_reconciliation`, `target_closed`, `removed`, con eventos. El servidor MCP arranca el bucle (`MT5_SUPERVISOR_ENABLED`, `MT5_SUPERVISOR_INTERVAL_SECONDS`, `MT5_SUPERVISOR_MAX_STALE_SECONDS`) en el mismo hilo serializado que las herramientas; sin reglas activas no consulta MT5. El servidor REST no ejecuta el bucle: las reglas creadas por REST las evalúa un servidor MCP con el supervisor activo sobre la misma base de estado. La frescura se mide por el tiempo que la hora del último tick permanece sin cambiar, observado por este proceso. Los SL/TP del bróker siguen siendo la protección independiente.
+`metatrader_client/supervisor.py`, herramientas `create_position_rule`, `list_position_rules`, `pause_position_rule`, `resume_position_rule`, `remove_position_rule` (REST `/api/v1/rules`). Reglas por ticket o por estrategia (opcionalmente un símbolo), métrica `pnl` (beneficio + swap) o `profit`, operador `>=`/`<=`, acción `close`. Estados: `active`, `paused`, `triggered`, `executing`, `fulfilled`, `failed`, `pending_reconciliation`, `target_closed`, `removed`, con eventos. El servidor MCP arranca el bucle (`MT5_SUPERVISOR_ENABLED`, `MT5_SUPERVISOR_INTERVAL_SECONDS`, `MT5_SUPERVISOR_MAX_STALE_SECONDS`) en el mismo hilo serializado que las herramientas; sin reglas activas no consulta MT5. El servidor REST no ejecuta el bucle: las reglas creadas por REST las evalúa un servidor MCP con el supervisor activo sobre la misma base de estado. Frescura: con `MT5_SERVER_UTC_OFFSET_SECONDS` se calcula a partir de la hora del tick; sin ella, la cotización solo cuenta como fresca después de que este proceso vea cambiar la hora del tick, y deja de serlo si no cambia durante `MT5_SUPERVISOR_MAX_STALE_SECONDS`. La primera observación tras arrancar nunca prueba frescura. La recuperación de reglas `triggered`/`executing` de otro propietario solo ocurre dentro de `run_cycle` y con el lease en manos de este supervisor (al menos 180 s, más que un cierre); construir un supervisor no cambia nada. El neto se informa por cierre (`realized_net_close`, solo el deal de este cierre) y por posición (`realized_net_position`: todos los deals, con la comisión de entrada y los cierres parciales anteriores). Los SL/TP del bróker siguen siendo la protección independiente.
 
 ## IMP-008 — Datos de análisis estructurados e incrementales
 
@@ -260,9 +261,18 @@ Usar parámetros del símbolo concreto del bróker; no asumir especificaciones g
 
 Cada mejora se cierra con implementación, pruebas de aceptación, contrato público actualizado y evidencia del alcance realmente validado. La implementación no activa reglas del supervisor ni envía operaciones por sí misma; no se ejecutó contra un terminal ni una cuenta.
 
+### Revisión del PR #3
+
+La revisión del head `6d74418` reprodujo cuatro hallazgos con `FakeMT5`. Se corrigieron así; sus cuatro reproducciones y cinco casos complementarios están en `tests/unit/test_review_regressions.py`:
+
+- [x] **P1:** el riesgo agregado podía superarse entre conexiones que comparten el Store, porque las reservas eran locales de cada guard. Ahora las reservas son durables y compartidas, y la comprobación final y la reserva son atómicas entre conexiones y procesos (ver IMP-006). Casos cubiertos: dos guards concurrentes, dos `Store` sobre el mismo archivo y un envío incierto visto desde otra conexión.
+- [x] **P1:** el primer tick visto se consideraba fresco aunque fuera antiguo. Ahora la frescura exige un cambio observado o la edad calculada con el desfase del servidor.
+- [x] **P2:** construir otro supervisor movía a `pending_reconciliation` una regla que otro propietario con lease válido seguía ejecutando. Ahora la recuperación solo ocurre con el lease adquirido y para reglas de otro propietario. Si un resultado llega tarde, se guarda en los eventos de la regla.
+- [x] **P2:** el neto realizado omitía la comisión de entrada. Ahora se calcula sobre todo el historial de la posición y aparte para el deal de este cierre.
+
 ### Evidencia de esta implementación
 
-- `pytest`: 245 pruebas aprobadas y 39 de integración omitidas (antes: 146 y 39). Las pruebas nuevas están en `tests/unit/test_imp001_bridge.py`, `test_imp002_003_snapshot_preview.py`, `test_imp004_requests.py`, `test_imp005_006_execution_limits.py` y `test_imp007_008_supervisor_candles.py`.
+- `pytest`: 254 pruebas aprobadas y 39 de integración omitidas tras la revisión (245 en el head revisado; 146 antes del plan). Las pruebas nuevas están en `tests/unit/test_imp001_bridge.py`, `test_imp002_003_snapshot_preview.py`, `test_imp004_requests.py`, `test_imp005_006_execution_limits.py` y `test_imp007_008_supervisor_candles.py`.
 - Pruebas existentes ajustadas al contrato nuevo: número y esquemas de herramientas MCP, argumentos de identidad reenviados por MCP y REST, y la prueba de reservas MT5-003 con resultado desconocido, que ahora desactiva `block_on_unresolved` para aislar la capa de reservas (con el bloqueo activo, la segunda orden se rechaza antes).
 - `FakeMT5` aplica ahora las modificaciones SLTP/MODIFY aceptadas (la verificación nueva detectaba, correctamente, que antes no lo hacía) y simula `order_check`, `order_calc_margin`, historial de órdenes y velas.
 - Arranque real por STDIO sin credenciales: `initialize`, `tools/list` (45 herramientas) y `get_bridge_health` responden; el log se escribe en el archivo configurado.
