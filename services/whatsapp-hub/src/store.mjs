@@ -6,6 +6,7 @@ export const wid = value => typeof value === 'string' ? value : value?._serializ
 export function validateConfig(config) {
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(config.source_id) || typeof config.enabled !== 'boolean' ||
       !Array.isArray(config.allowed_group_ids) || !Array.isArray(config.allowed_author_ids) ||
+      (config.allowed_newsletter_ids !== undefined && (!Array.isArray(config.allowed_newsletter_ids) || config.allowed_newsletter_ids.some(id=>typeof id!=='string' || !/^\d+@newsletter$/.test(id)))) ||
       config.allowed_group_ids.some(id => typeof id !== 'string' || !/^\d+(?:-\d+)?@g\.us$/.test(id)) ||
       config.allowed_author_ids.some(id => typeof id !== 'string' || !/^\d+@(c\.us|lid)$/.test(id)) ||
       !Number.isFinite(Date.parse(config.capture_after))) throw Error('Invalid receiver configuration');
@@ -36,8 +37,10 @@ export class Store {
     const author = wid(message.author);
     if (config.source_id !== this.source) throw Error('Source identity changed');
     // Filter before persistence; no private chats, own messages, or unauthorized groups.
-    if (!config.enabled || message.fromMe || !config.allowed_group_ids.includes(group) ||
-        !group.endsWith('@g.us') || (config.allowed_author_ids.length && !config.allowed_author_ids.includes(author))) return false;
+    const allowed = group.endsWith('@g.us') && config.allowed_group_ids.includes(group) ||
+      group.endsWith('@newsletter') && (config.allowed_newsletter_ids || []).includes(group);
+    if (!config.enabled || message.fromMe || !allowed ||
+        (config.allowed_author_ids.length && !config.allowed_author_ids.includes(author))) return false;
     const timestamp = Number(message.timestamp || message.t);
     if (!Number.isFinite(timestamp) || timestamp * 1000 < Date.parse(config.capture_after) || timestamp * 1000 > Date.now()+300000) return false;
     const id = wid(message.id);

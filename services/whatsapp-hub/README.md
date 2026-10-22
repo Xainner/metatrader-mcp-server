@@ -2,6 +2,8 @@
 
 Receptor de solo lectura con `@wppconnect-team/wppconnect` **2.3.5**, Chromium y Node 24. La cuenta vinculada debe pertenecer al grupo de señales de la comunidad. No se crea un bot de WhatsApp Business ni se usa un token de Telegram: se vincula la sesión con QR.
 
+También admite **canales de WhatsApp** (`@newsletter`), con una lista permitida independiente `allowed_newsletter_ids`. La cuenta debe seguir ya el canal; el receptor no sigue canales ni se une a grupos. La pantalla muestra metadatos de grupos y canales, sin leer su historial. La selección por nombre debe resolverse a un ID exacto; un nombre homónimo requiere aclaración. Se escuchan eventos `onMessage` y `onAnyMessage` con deduplicación antes de guardar; solo pasa la fuente explícitamente habilitada. La recepción real de un canal debe validarse observando una publicación nueva: no se presupone por el estado conectado.
+
 ## Componentes
 
 - `src/server.mjs`: QR y estado por HTTP privado; escucha mensajes nuevos, ediciones y revocaciones. No ofrece funciones para enviar mensajes, unirse a grupos ni operar.

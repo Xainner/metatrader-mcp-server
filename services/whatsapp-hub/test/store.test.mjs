@@ -38,3 +38,13 @@ test('events survive reopening and revoked message is a separate revision',()=>{
     assert.throws(()=>store.receive(message,{...config,source_id:'other'}),/identity changed/);
   } finally { store.db.close(); rmSync(home,{recursive:true}); }
 });
+test('WhatsApp channels require a separate exact allowlist and never grant private chat access',()=>{
+  const store=new Store(':memory:','test');
+  const channel={...message,chatId:'321@newsletter',id:'channel-msg'};
+  assert.equal(store.receive(channel,config),false);
+  const enabled={...config,allowed_newsletter_ids:['321@newsletter']};
+  assert.equal(store.receive(channel,enabled),true);
+  assert.equal(store.receive({...channel,chatId:'999@newsletter'},enabled),false);
+  assert.equal(store.receive({...channel,chatId:'321@c.us'},enabled),false);
+  assert.equal(store.count(),1);
+});

@@ -17,9 +17,10 @@ for (const name of ['SingletonLock','SingletonCookie','SingletonSocket']) {
   catch (error) { if (error.code!=='ENOENT') throw error; }
 }
 const store = new Store(path.join(home, 'data/signals.sqlite3'), initial.source_id);
-let state = 'starting', qr = null, qrAt = 0, client = null, groups = [], lastError = null, authenticated = false, mainReady = false;
+let state = 'starting', qr = null, qrAt = 0, client = null, groups = [], channels = [], lastError = null, authenticated = false, mainReady = false;
 const status = () => ({state:!authenticated && qr ? 'awaiting_qr' : state, source_id:initial.source_id, enabled:readConfig().enabled,
   authorized_groups:readConfig().allowed_group_ids.length, stored_events:store.count(),
+  authorized_channels:(readConfig().allowed_newsletter_ids || []).length,
   qr_available:!!qr && Date.now()-qrAt < 45000, last_error:lastError,
   qr_version:qrAt, authenticated, receiver_ready:authenticated && mainReady,
   execution_authorized:false, as_of:new Date().toISOString()});
@@ -50,6 +51,7 @@ http.createServer(async (req,res) => {
   try {
     if (req.url === '/status') { res.setHeader('Content-Type','application/json'); return res.end(JSON.stringify(status())); }
     if (req.url === '/groups') { res.setHeader('Content-Type','application/json'); return res.end(JSON.stringify(groups)); }
+    if (req.url === '/channels') { res.setHeader('Content-Type','application/json'); return res.end(JSON.stringify(channels)); }
     if (req.url.split('?')[0] === '/qr.png') {
       if (!qr || Date.now()-qrAt > 45000) { res.writeHead(404); return res.end(); }
       res.setHeader('Content-Type','image/png'); return res.end(qr);
@@ -59,8 +61,8 @@ http.createServer(async (req,res) => {
     res.end(`<!doctype html><html lang="es"><meta charset="utf-8"><title>Rinari · WhatsApp</title>
       <style>body{font:18px system-ui;max-width:760px;margin:40px auto;background:#101920;color:#edf8f4;padding:20px}img{width:456px;max-width:calc(100% - 48px);background:white;padding:24px;image-rendering:pixelated}pre{white-space:pre-wrap}h1{color:#80e8bc}</style>
       <h1>WhatsApp · Señales para Rinari</h1><p>En tu teléfono: WhatsApp → Dispositivos vinculados → Vincular dispositivo. Escanea el QR.</p>
-      <img id="qr" alt="Esperando código QR"><pre id="state"></pre><h2>Grupos disponibles</h2><p>Indica al agente el grupo exacto que autorizas. El receptor solo guarda mensajes de su lista permitida.</p><pre id="groups"></pre>
-      <script>let version=0;async function refresh(){const s=await(await fetch('/status')).json();document.getElementById('state').textContent=JSON.stringify(s,null,2);const q=document.getElementById('qr');q.hidden=!s.qr_available;if(s.qr_available&&version!==s.qr_version){q.src='/qr.png?t='+s.qr_version;version=s.qr_version;}document.getElementById('groups').textContent=JSON.stringify(await(await fetch('/groups')).json(),null,2);}setInterval(refresh,2000);refresh();</script></html>`);
+      <img id="qr" alt="Esperando código QR"><pre id="state"></pre><h2>Grupos y canales disponibles</h2><p>Indica al agente la fuente exacta que autorizas. El receptor solo guarda mensajes de su lista permitida.</p><pre id="groups"></pre>
+      <script>let version=0;async function refresh(){const s=await(await fetch('/status')).json();document.getElementById('state').textContent=JSON.stringify(s,null,2);const q=document.getElementById('qr');q.hidden=!s.qr_available;if(s.qr_available&&version!==s.qr_version){q.src='/qr.png?t='+s.qr_version;version=s.qr_version;}document.getElementById('groups').textContent=JSON.stringify({grupos:await(await fetch('/groups')).json(),canales:await(await fetch('/channels')).json()},null,2);}setInterval(refresh,2000);refresh();</script></html>`);
   } catch { res.writeHead(503); res.end('Receiver unavailable'); }
 }).listen(3000,'0.0.0.0');
 
@@ -81,6 +83,7 @@ try {
   if (authenticated) qr=null;
   state=authenticated && mainReady ? 'connected' : 'awaiting_login';
   client.onMessage(msg => record(msg));
+  client.onAnyMessage(msg => record(msg));
   client.onMessageEdit(data => record({...data.msg, id:data.id, chatId:wid(data.chat)}, 'edit'));
   client.onRevokedMessage(data => {
     const group = wid(data.from), id = String(data.refId || '');
@@ -89,8 +92,11 @@ try {
   });
   client.onStateChange(value => { state=String(value).replace(/[^a-zA-Z0-9_-]/g,'').slice(0,80); });
   const refreshGroups = async () => {
-    try { groups=(await client.listChats({onlyGroups:true,count:1000})).map(g=>({id:wid(g.id), name:g.name || g.formattedTitle || '',
-      community:!!g.groupMetadata?.isParentGroup, announcements:!!g.groupMetadata?.isDefaultSubgroup})); }
+    try {
+      groups=(await client.listChats({onlyGroups:true,count:1000})).map(g=>({id:wid(g.id), name:g.name || g.formattedTitle || '',
+        community:!!g.groupMetadata?.isParentGroup, announcements:!!g.groupMetadata?.isDefaultSubgroup}));
+      channels=(await client.listChats({onlyNewsletter:true,count:1000})).map(g=>({id:wid(g.id), name:g.name || g.formattedTitle || ''}));
+    }
     catch { fail('GROUP_DISCOVERY_FAILED'); }
   };
   await refreshGroups(); setInterval(refreshGroups,60000);
