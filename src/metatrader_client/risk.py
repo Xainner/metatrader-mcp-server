@@ -66,8 +66,11 @@ and the reservation is inserted in one ``BEGIN IMMEDIATE`` transaction, which
 serializes competing openings across connections and processes; the second
 one sees the first one's reservation and is rejected if the budget is spent.
 The listings and stop-loss losses used by that final check are the ones read
-by :meth:`RiskGuard.check_new_order` just before, together with the version
-of the account's reservation book they were reconciled with. Every change of
+by :meth:`RiskGuard.check_new_order` just before. The version of the
+account's reservation book is sampled before the terminal is read, and the
+plan stays valid only if the book still has that version when the listings
+are reconciled and again at commit time (changes made by the plan's own
+reconciliation are followed). Every change of
 the book (a reservation stored, updated, released because the terminal lists
 it, or expired) bumps that version; if it changed before the final check, the
 listings are read again and the limits re-evaluated (up to
@@ -104,6 +107,7 @@ logger = logging.getLogger(__name__)
 ACCOUNT_TRADE_MODE_DEMO = 0
 RESERVATION_TTL_SECONDS = 60.0
 MAX_COMMIT_ATTEMPTS = 3
+STALE_VERSION = -1  # a plan whose listings may predate a change of the book
 ORDER_FILLING_FOK = 0
 ORDER_FILLING_IOC = 1
 _EPS = 1e-9
@@ -318,6 +322,10 @@ class RiskGuard:
         row = db.execute("SELECT version FROM reservation_versions WHERE account_key = ?", (self._account_key,)).fetchone()
         return int(row["version"]) if row else 0
 
+    def _current_version(self) -> int:
+        rows = self._book().query("SELECT version FROM reservation_versions WHERE account_key = ?", (self._account_key,))
+        return int(rows[0]["version"]) if rows else 0
+
     def _bump(self, db) -> None:
         """Record that the reservation book of the account changed (call inside the changing transaction)."""
         db.execute(
@@ -478,6 +486,9 @@ class RiskGuard:
         )
         if needs_listings:
             if plan["positions"] is None:
+                # The book version is sampled BEFORE the terminal is read: a version read
+                # afterwards could belong to a change the listings do not reflect.
+                plan["version"] = self._current_version()
                 positions, error = _read(mt5, "positions_get")
                 if error:
                     return f"{prefix}Cannot verify exposure limits, new orders are blocked: {error}"
@@ -510,12 +521,11 @@ class RiskGuard:
                 if error:
                     return error
             with self._book().transaction() as db:
+                consistent = self._version(db) == plan["version"]
                 reserved = self._reserved(db, plan["positions"], plan["orders"], magic=magic, now=time.time())
-                version = self._version(db)
-            if plan["version"] is None:
-                plan["version"] = version
-            elif plan["version"] != version:
-                plan["version"] = -1  # the book changed between scopes: force a re-read at commit
+                # Our own reconciliation may bump the version; the plan follows it only if no other
+                # change happened since the listings were read. Otherwise -1 forces a re-read at commit.
+                plan["version"] = self._version(db) if consistent else STALE_VERSION
             error = self._evaluate_scope(scope, reserved, volume=volume, plan=plan)
             if error:
                 return error
