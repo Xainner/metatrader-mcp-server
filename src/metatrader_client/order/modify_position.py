@@ -3,6 +3,8 @@ from typing import Optional, Union
 from ..risk import get_risk_guard
 from ..types import TradeRequestActions
 from .send_order import send_order
+from ._confirm import confirm_levels
+from ._ownership import ownership_error
 from ._result import to_client_response
 from ._validation import normalize_price, check_stops
 
@@ -12,6 +14,7 @@ def modify_position(
 	*,
 	stop_loss: Optional[Union[int, float]] = None,
 	take_profit: Optional[Union[int, float]] = None,
+	strategy_id: Optional[str] = None,
 ):
 	"""
 	Modify an existing position's stop loss and take profit levels.
@@ -47,6 +50,9 @@ def modify_position(
 			"data": None,
 		}
 	position = positions[0]
+	error = ownership_error(position, strategy_id, label=f"Position {position_id}")
+	if error:
+		return { "error": True, "message": error, "data": None }
 
 	if stop_loss is None and take_profit is None:
 		return { "error": True, "message": "Nothing to modify: pass stop_loss and/or take_profit", "data": None }
@@ -102,7 +108,21 @@ def modify_position(
 		take_profit = levels["tp"],
 	)
 
-	return to_client_response(
+	result = to_client_response(
 		response,
 		f"Modified position {position_id}: SL {levels['sl']}, TP {levels['tp']} ({response['retcode_name']})",
 	)
+	if not response["success"]:
+		result["verification"] = "unknown" if response["status"] == "no_response" else "not_applied"
+		return result
+	result.update(confirm_levels(
+		mt5, mt5.positions_get(ticket=position_id), symbol_info=symbol_info,
+		expected={"sl": levels["sl"], "tp": levels["tp"]}, label="position_listed",
+	))
+	if result["verification"] != "confirmed":
+		result["error"] = True
+		result["message"] += (
+			f"; the final levels could not be confirmed ({result['verification']}, see checks). "
+			"Read the position before sending another modification."
+		)
+	return result

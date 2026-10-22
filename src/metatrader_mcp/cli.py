@@ -2,6 +2,7 @@ import click
 import os
 from dotenv import load_dotenv
 from metatrader_mcp.server import mcp
+from metatrader_mcp.logging_config import configure_logging
 from metatrader_mcp.utils import resolve_transport_config, run_mcp
 
 # Load .env before click resolves options from environment variables.
@@ -26,6 +27,8 @@ def main(login, password, server, path, transport, host, port, ssl_certfile, ssl
     if path:
         os.environ["MT5_PATH"] = path
 
+    # Logs go to a rotating file: stdout carries JSON-RPC and stderr may not be read.
+    configure_logging()
     transport, host, port = resolve_transport_config(transport, host, port)
     try:
         run_mcp(mcp, transport, host, port, ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)

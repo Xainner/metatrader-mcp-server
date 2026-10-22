@@ -503,13 +503,33 @@ client.disconnect()
 
 ### Account Management
 - `get_account_info` - Get balance, equity, profit, margin level, leverage, currency
+- `get_trading_snapshot` - Quote, account, positions, pending orders and risk limits of a symbol in one call
+- `get_bridge_health` - Server version, connectivity, blocked calls, latency percentiles, errors and log state
 
 ### Market Data
 - `get_symbols` - List all available trading symbols
 - `get_symbol_price` - Get current bid/ask price for a symbol
-- `get_candles_latest` - Get recent price candles (OHLCV data)
+- `get_candles` - Structured candles (JSON schema `candles/v1`): ascending, closed/forming flag, gaps, incremental `since`
+- `get_candles_multi` - Several timeframes in one call, with errors per timeframe
+- `get_candles_latest` - Get recent price candles (OHLCV data, CSV)
 - `get_candles_by_date` - Get historical candles for a date range
-- `get_symbol_info` - Get detailed symbol information
+- `get_symbol_specifications` - Broker contract, volume, stop and execution specification of a symbol
+
+### Pre-trade Checks
+- `preview_order` - Normalized order, loss at SL, profit at TP, margin, limits and `order_check`; returns a `preview_id`
+- `calculate_trade_outcome` - Estimated profit/loss in the account currency
+- `calculate_required_margin` - Estimated margin in the account currency
+
+### Request Identity and Limits
+- `get_request_status` / `list_requests` - Recorded state of each `request_id`
+- `reconcile_request` - Find the effects of an uncertain request in the terminal (never sends)
+- `resolve_request` - Explicit, audited decision for a request whose outcome stays unknown
+- `get_risk_limits` - Effective limits and their change history
+- `disable_new_entries` - Block new openings; closing and reducing exposure stay available
+
+### Position Supervisor
+- `create_position_rule` - Close a position (or a strategy's positions) when its floating P&L crosses a threshold
+- `list_position_rules`, `pause_position_rule`, `resume_position_rule`, `remove_position_rule`
 
 ### Order Execution
 - `place_market_order` - Execute instant BUY/SELL orders
@@ -522,10 +542,12 @@ client.disconnect()
 - `get_positions_by_symbol` - Filter positions by trading pair
 - `get_positions_by_id` - Get specific position details
 - `close_position` - Close a specific position
-- `close_all_positions` - Close all open positions
-- `close_all_positions_by_symbol` - Close all positions for a symbol
-- `close_all_profitable_positions` - Close only winning trades
-- `close_all_losing_positions` - Close only losing trades
+- `close_all_positions` - Close all open positions in a scope
+- `close_all_positions_by_symbol` - Close all positions for a symbol in a scope
+- `close_all_profitable_positions` - Close only winning trades in a scope
+- `close_all_losing_positions` - Close only losing trades in a scope
+
+Bulk MCP tools require `scope`: `strategy` (with `strategy_id`), `manual` (magic 0) or `all`; `dry_run: true` lists the affected tickets without sending anything.
 
 ### Pending Orders
 - `get_all_pending_orders` - List all pending orders
@@ -593,6 +615,16 @@ Risk limits are enforced in code on every request that opens exposure, independe
 | `MT5_REQUIRE_STOP_LOSS` | `false` | Reject orders without stop loss and the removal of a stop loss |
 | `MT5_MAX_DAILY_LOSS` | | Block new exposure once today's realized + floating loss reaches this amount (account currency, day of the trade server) |
 | `MT5_DUPLICATE_WINDOW_SECONDS` | `10` | Reject a request identical to one sent within this window (`0` disables) |
+| `MT5_ALLOW_NEW_ENTRIES` | `true` | `false` blocks every new opening; closing and reducing exposure stay available |
+| `MT5_BLOCK_ON_UNRESOLVED` | `true` | Block new openings on a symbol while a request on it has an unknown outcome |
+| `MT5_MAX_ENTRIES_PER_DAY` | | Maximum entries per server day (entry deals + pending orders + unlisted orders) |
+| `MT5_MAX_AGGREGATE_RISK_PCT` | | Maximum sum of the losses at the stop losses of positions, pending orders and the new order, in % of equity; any item without SL blocks |
+| `MT5_STRATEGY_LIMITS` | | JSON per `strategy_id` with the limits above applied to the strategy's own items |
+| `MT5_STRATEGY_MAGICS` | | JSON mapping `strategy_id` to magic number (otherwise a stable hash of the ID) |
+| `MT5_MISSING_PROTECTION_POLICY` | `report` | What to do when a requested SL/TP is missing on the new position: `report`, `retry_sltp` or `close` |
+| `MT5_REQUIRE_PREVIEW` | `false` | Require a valid `preview_id` for every opening |
+| `MT5_STATE_DB` | `~/.metatrader_mcp/state.sqlite3` | Request registry, limits log and supervisor rules (no credentials) |
+| `MT5_SERVER_UTC_OFFSET_SECONDS` | | Trade server clock minus UTC; enables UTC candle times and quote ages |
 
 The same settings can be passed to `MT5Client` as `config["risk"] = {"max_daily_loss": 200, ...}`.
 
@@ -610,6 +642,10 @@ Trading results include `status` and `retcode`. Only `error: false` means the re
 | `no_response` | The terminal did not answer: check positions and orders before retrying |
 
 Closing a position also returns `verification`: `confirmed` only when a valid query no longer lists the position, `remaining` (with `remaining_volume`), `unknown` (the final state could not be read: check positions before retrying) or `not_closed`.
+
+Openings return `request_id` and `request_state`, plus `verification` (`confirmed`, `partial`, `pending`, `protection_missing`, `mismatch`, `unknown`), `checks` (what was verified, when, and what is unknown), `execution` (filled volume, executed price, slippage in points, known and unknown costs, timings) and `protection` (requested vs effective SL/TP). Repeating a `request_id` returns the recorded result and never sends again. Modifications and cancellations return `error: false` only when the terminal shows the change (`verification: "confirmed"`). See [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) for the full contract and its migration notes.
+
+The MCP server runs every MetaTrader 5 call on one worker thread with deadlines (`MCP_READ_TIMEOUT_SECONDS`, `MCP_SEND_TIMEOUT_SECONDS`), reconnects within a bounded policy, and writes logs to a rotating file (`MCP_LOG_FILE`) instead of stdout/stderr.
 
 Bulk operations (`close_all_*`, `cancel_all_*`) return the result of every item, the tickets whose final state is unknown (`unverified`) and the tickets still present afterwards.
 

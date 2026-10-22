@@ -2,7 +2,7 @@
 
 import json
 from collections import namedtuple
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pandas as pd
 import pytest
@@ -37,11 +37,15 @@ async def test_server_starts_without_credentials_and_lists_tools():
     async with create_connected_server_and_client_session(server.mcp._mcp_server) as session:
         tools = {tool.name: tool for tool in (await session.list_tools()).tools}
 
-    assert len(tools) == 26
+    assert len(tools) == 45
     assert "get_candles_by_date" in tools
+    assert {"get_bridge_health", "get_trading_snapshot", "preview_order", "get_request_status", "get_candles"} <= set(tools)
     market = tools["place_market_order"].inputSchema["properties"]
     assert {"symbol", "volume", "type", "stop_loss", "take_profit"} <= set(market)
     assert set(tools["place_market_order"].inputSchema["required"]) == {"symbol", "volume", "type"}
+    assert {"request_id", "strategy_id", "preview_id"} <= set(market)
+    # Bulk tools require an explicit scope (IMP-006).
+    assert "scope" in tools["close_all_positions"].inputSchema["required"]
 
 
 async def test_tool_without_credentials_reports_configuration_error():
@@ -66,7 +70,8 @@ async def test_trading_tool_returns_json_serializable_result(fake_client):
     payload = json.loads(result.content[0].text)
     assert payload["data"] == {"retcode": 10009, "order": 42, "price": 1.1, "request": {"symbol": "EURUSD", "sl": 1.09, "tp": 1.12}}
     fake_client.order.place_market_order.assert_called_once_with(
-        symbol="EURUSD", volume=0.1, type="BUY", stop_loss=1.09, take_profit=None
+        symbol="EURUSD", volume=0.1, type="BUY", stop_loss=1.09, take_profit=None,
+        request_id=ANY, strategy_id=None, preview_id=None,
     )
     fake_client.disconnect.assert_called_once()
 

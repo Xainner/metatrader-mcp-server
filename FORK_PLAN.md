@@ -6,7 +6,7 @@ Este fork se mantiene para corregir los problemas detectados en la revisión ant
 
 ## Plan de mejoras de ejecución, rendimiento y verificación
 
-Las ocho mejoras propuestas después del PR #2 están documentadas en [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md), con prioridades, entregas, herramientas propuestas y criterios de aceptación. Su implementación queda pendiente; este documento no habilita operaciones ni cambia límites de riesgo.
+Las ocho mejoras propuestas después del PR #2 están documentadas en [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md), con prioridades, entregas, herramientas y criterios de aceptación. Están implementadas en la versión 0.7.0 y probadas con el terminal simulado; el plan indica, criterio por criterio, qué queda pendiente (validación en cuenta demo, mediciones reales y el drenaje de stderr en Rinari). Los límites nuevos están desactivados por defecto y ninguna regla del supervisor se activa sin una petición explícita.
 
 El [estudio completo de automatización](docs/AUTOMATION_IMPLEMENTATION_STUDY.md) desarrolla recepción de señales, integración con Rinari Agency y un centro de operaciones de dos a ocho agentes. El [anexo de contratos](docs/SIGNAL_TOOL_CONTRACTS.md) define las herramientas y permisos propuestos.
 

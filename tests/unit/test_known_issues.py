@@ -281,7 +281,8 @@ def test_mt5_003_rejected_order_releases_its_reservation(fake_mt5, connection):
 
 
 def test_mt5_003_unknown_outcome_keeps_reservation_and_blocks_duplicate(fake_mt5, connection):
-    with_risk(connection, max_open_positions=1, duplicate_window_seconds=10)
+    # The request registry (IMP-004) would block both requests first; this test isolates the reservation layer.
+    with_risk(connection, max_open_positions=1, duplicate_window_seconds=10, block_on_unresolved=False)
     fake_mt5.results = [None]
 
     assert place_market_order(connection, type="BUY", symbol="EURUSD", volume=0.1)["status"] == "no_response"
@@ -383,7 +384,7 @@ def test_position_and_remainder_listed_are_not_counted_twice(fake_mt5, connectio
     fake_mt5.orders = [make_order(ticket, type=0, volume=0.06)]
 
     assert try_buy(connection, 0.05)["error"] is False  # 0.04 + 0.06 listed + 0.05 = 0.15
-    assert connection.risk_guard._reservations[0].ticket != ticket  # the first reservation was released
+    assert connection.risk_guard.reservations()[0].ticket != ticket  # the first reservation was released
 
 
 def test_position_listed_but_remainder_not_listed_keeps_the_remainder(fake_mt5, connection):
@@ -439,7 +440,7 @@ def test_published_fills_are_reconciled_without_double_counting(fake_mt5, connec
     blocked = try_buy(connection, 0.06)
     assert blocked["error"] is True
     assert "Total exposure would be 0.16 lots" in blocked["message"]
-    assert connection.risk_guard._reservations == []
+    assert connection.risk_guard.reservations() == []
     assert try_buy(connection, 0.05)["error"] is False
 
 

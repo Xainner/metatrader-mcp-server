@@ -113,12 +113,63 @@ def failure(message: str, *, status: Optional[str] = STATUS_REJECTED) -> Dict[st
     }
 
 
+# Registry state -> status reported when a request_id is repeated.
+_STATE_STATUS = {
+    "filled": STATUS_DONE,
+    "partially_filled": STATUS_PARTIAL,
+    "accepted": STATUS_PLACED,
+    "rejected": STATUS_REJECTED,
+    "unknown": STATUS_NO_RESPONSE,
+    "sending": STATUS_NO_RESPONSE,
+    "prepared": "in_progress",
+    "reconciled": "reconciled",
+}
+_EXECUTED_STATES = ("filled", "partially_filled", "accepted")
+
+
+def replayed(record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Result for a request_id that is already recorded: nothing is sent again.
+
+    ``previous_result`` holds the client response stored for the first
+    request, when it finished; ``request_state`` the current registry state.
+    """
+    state = record["state"]
+    in_flight = state in ("prepared", "sending")
+    message = (
+        f"request_id {record['request_id']} is already recorded with state '{state}'"
+        + (f" (outcome {record['outcome']})" if record.get("outcome") else "")
+        + ("; it is still in progress" if in_flight else "")
+        + "; nothing was sent again. Use a new request_id for a new operation."
+    )
+    return {
+        "success": state in _EXECUTED_STATES,
+        "status": _STATE_STATUS.get(state, state),
+        "retcode": record.get("retcode"),
+        "retcode_name": TradeReturnCodes.to_string(record["retcode"]) if record.get("retcode") is not None else None,
+        "message": message,
+        "data": None,
+        "request": None,
+        "request_id": record["request_id"],
+        "request_state": state,
+        "replayed": True,
+        "previous_result": record.get("result"),
+    }
+
+
+_PASS_THROUGH = ("request_id", "request_state", "replayed", "previous_result", "timings")
+
+
 def to_client_response(response: Dict[str, Any], message: Optional[str] = None) -> Dict[str, Any]:
     """Convert a send_order result into the public ``{"error", "message", "data"}`` format."""
-    return {
+    result = {
         "error": not response["success"],
-        "message": message if (message and response["success"]) else response["message"],
+        "message": message if (message and response["success"] and not response.get("replayed")) else response["message"],
         "data": response["data"] if response["success"] else None,
         "status": response.get("status"),
         "retcode": response.get("retcode"),
     }
+    for key in _PASS_THROUGH:
+        if key in response:
+            result[key] = response[key]
+    return result

@@ -30,6 +30,12 @@ from .close_all_profitable_positions import close_all_profitable_positions
 from .close_all_losing_positions import close_all_losing_positions
 from .cancel_all_pending_orders import cancel_all_pending_orders
 from .cancel_pending_orders_by_symbol import cancel_pending_orders_by_symbol
+from .calculate_trade_outcome import calculate_trade_outcome
+from .calculate_required_margin import calculate_required_margin
+from .preview_order import preview_order
+from .get_trading_snapshot import get_trading_snapshot
+from .requests import get_request_status, list_requests, reconcile_request, resolve_request
+from .limits import get_risk_limits, disable_new_entries, enable_new_entries
 
 __all__ = [
 
@@ -61,4 +67,15 @@ __all__ = [
     "close_all_losing_positions",
     "cancel_all_pending_orders",
     "cancel_pending_orders_by_symbol",
+    "calculate_trade_outcome",
+    "calculate_required_margin",
+    "preview_order",
+    "get_trading_snapshot",
+    "get_request_status",
+    "list_requests",
+    "reconcile_request",
+    "resolve_request",
+    "get_risk_limits",
+    "disable_new_entries",
+    "enable_new_entries",
 ]

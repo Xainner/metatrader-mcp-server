@@ -71,6 +71,7 @@ class MT5Connection:
         self.backoff_factor = config.get("backoff_factor", 1.5)
         self.cooldown_time = config.get("cooldown_time", 2.0)
         self.risk_guard = RiskGuard(RiskConfig.from_sources(config.get("risk")))
+        self._init_state(config)
         self._connected = False
         self._last_connection_time = 0
         
@@ -87,6 +88,27 @@ class MT5Connection:
             os.path.expanduser("~\\AppData\\Roaming\\MetaQuotes\\Terminal\\*\\terminal64.exe"),
         ]
     
+    def _init_state(self, config: Dict) -> None:
+        """
+        Durable state (request registry, limits log, supervisor rules) and previews.
+
+        The database path comes from ``state_db`` in the config, else
+        ``MT5_STATE_DB``, else ``~/.metatrader_mcp/state.sqlite3``. The
+        effective risk limits are logged when they changed since the last start,
+        and old final requests are purged (``MT5_REQUEST_RETENTION_DAYS``).
+        """
+        from .store import Store, default_path
+        from .requests_registry import RequestRegistry
+        from .order._preview_store import PreviewStore
+
+        self.store = Store(default_path(config.get("state_db")))
+        self.request_registry = RequestRegistry(self.store)
+        self.preview_store = PreviewStore()
+        self.store.record_limits(self.risk_guard.config.as_dict(), source="startup")
+        purged = self.request_registry.purge()
+        if purged:
+            logger.info("Purged %s final trade requests past the retention period", purged)
+
     def _find_terminal_path(self) -> str:
         return _find_terminal_path(self)
 

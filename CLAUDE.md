@@ -5,7 +5,7 @@
 MCP server enabling AI assistants to trade on MetaTrader 5 via natural language. Provides both MCP (stdio) and HTTP/REST interfaces.
 
 **Stack**: Python 3.10+ • FastMCP • FastAPI • MetaTrader5 SDK • Pandas • Pydantic • pytest
-**Version**: 0.6.0 (Beta)
+**Version**: 0.7.0 (Beta)
 **Repo**: https://github.com/ariadng/metatrader-mcp-server
 
 ---
@@ -21,6 +21,11 @@ metatrader_client/
 ├── market/       # Prices, candles, symbols
 ├── order/        # Trade execution and position management
 ├── types/        # Enums (OrderType, Timeframe, TradeAction, etc.)
+├── risk.py       # Risk limits, reservations, new entries switch
+├── store.py      # SQLite state (request registry, limits log, rules)
+├── requests_registry.py  # request_id states and reconciliation data
+├── strategy.py   # strategy_id -> magic, ownership and bulk scopes
+├── supervisor.py # Local position rules and evaluation loop
 └── client.py     # Main MT5Client class
 ```
 
@@ -31,8 +36,9 @@ def place_market_order(connection, *, type: str, symbol: str, volume: Union[floa
 
 ### 2. `metatrader_mcp` - MCP Server
 - FastMCP with STDIO transport (default); SSE/streamable HTTP via `--transport`, bound to 127.0.0.1 unless `MCP_AUTH_TOKEN` and TLS are configured (`metatrader_mcp/security.py`)
-- Tools: `@mcp.tool()` decorated functions
-- Client access: `client = get_client(ctx)`
+- Tools: `async` functions decorated with `@mcp.tool()`; MT5 work runs through `metatrader_mcp/bridge.py` (one worker thread, deadlines, bounded reconnection): `await _read(ctx, "tool", lambda client: ...)` or `await _trade(...)` for sends
+- Logs: `metatrader_mcp/logging_config.py` (rotating file; never stdout, stderr only on request)
+- Client access inside the bridge callable: the `client` argument (from `get_client(ctx)`)
 - Returns: CSV strings for DataFrames, dicts for objects
 
 ### 3. `metatrader_openapi` - REST API
@@ -64,6 +70,7 @@ def operation(connection, *, param: type, optional: Optional[type] = None):
 ### Return Formats
 - **Client operations**: `{"error": False, "message": "...", "data": {...}}` (dict) or DataFrame
 - **Trading operations** add `status` (done|partial|placed|no_changes|rejected|no_response) and `retcode`; `send_order` interprets `retcode`, never `last_error()` alone
+- Openings add `request_id`, `request_state`, `verification`, `checks`, `execution`, `protection`; repeated `request_id` → `replayed: true`, nothing sent
 - **MCP tools**: `df.to_csv()` for DataFrames, dict/list for objects
 - **REST endpoints**: `df.to_dict(orient="records")` or dict (auto JSON)
 
@@ -139,12 +146,11 @@ def mt5_client():
 1. Add to `metatrader_mcp/server.py`:
 ```python
 @mcp.tool()
-def tool_name(ctx: Context, param: type) -> str:
+async def tool_name(ctx: Context, param: type) -> dict:
     """Description for AI."""
-    client = get_client(ctx)
-    result = client.module.operation(param)
-    return result.to_csv() if hasattr(result, 'to_csv') else result
+    return _to_plain(await _read(ctx, "tool_name", lambda client: client.module.operation(param)))
 ```
+2. Tools that send orders use `_trade(...)` so a deadline is reported as `no_response`/`unknown`, never as a cancellation.
 
 ### New REST Endpoint
 1. Add to `metatrader_openapi/routers/<module>.py`:
@@ -195,7 +201,9 @@ async def endpoint(request: Request, param: type = Body(...)):
 **Required**: `LOGIN`, `PASSWORD`, `SERVER`
 **Optional**: `MT5_PATH` (path to MT5 terminal executable, auto-detected if not set), `OPENAPI_TITLE`, `OPENAPI_VERSION`
 **MCP Transport**: `MCP_TRANSPORT` (stdio|sse|streamable-http, default: stdio), `MCP_HOST` (default: 127.0.0.1), `MCP_PORT` (default: 8080), `MCP_AUTH_TOKEN`, `MCP_SSL_CERTFILE`, `MCP_SSL_KEYFILE`, `MCP_ALLOW_INSECURE_REMOTE`, `MCP_ALLOWED_HOSTS`
-**Risk limits** (`metatrader_client/risk.py`): `MT5_ALLOW_LIVE_TRADING` (default false: demo only), `MT5_MAX_VOLUME_PER_ORDER`, `MT5_MAX_TOTAL_VOLUME`, `MT5_MAX_OPEN_POSITIONS`, `MT5_MAX_RISK_PER_TRADE_PCT`, `MT5_REQUIRE_STOP_LOSS`, `MT5_MAX_DAILY_LOSS`, `MT5_DUPLICATE_WINDOW_SECONDS`
+**Risk limits** (`metatrader_client/risk.py`): `MT5_ALLOW_LIVE_TRADING` (default false: demo only), `MT5_MAX_VOLUME_PER_ORDER`, `MT5_MAX_TOTAL_VOLUME`, `MT5_MAX_OPEN_POSITIONS`, `MT5_MAX_RISK_PER_TRADE_PCT`, `MT5_REQUIRE_STOP_LOSS`, `MT5_MAX_DAILY_LOSS`, `MT5_DUPLICATE_WINDOW_SECONDS`, `MT5_ALLOW_NEW_ENTRIES`, `MT5_BLOCK_ON_UNRESOLVED`, `MT5_MAX_ENTRIES_PER_DAY`, `MT5_MAX_AGGREGATE_RISK_PCT`, `MT5_STRATEGY_LIMITS` (JSON), `MT5_STRATEGY_MAGICS` (JSON), `MT5_MISSING_PROTECTION_POLICY`
+**State and data**: `MT5_STATE_DB`, `MT5_REQUEST_STALE_SECONDS`, `MT5_REQUEST_RETENTION_DAYS`, `MT5_PREVIEW_TTL_SECONDS`, `MT5_PREVIEW_MAX_PRICE_MOVE_POINTS`, `MT5_REQUIRE_PREVIEW`, `MT5_SERVER_UTC_OFFSET_SECONDS`, `MT5_MAX_CANDLES`, `MT5_SUPERVISOR_ENABLED`, `MT5_SUPERVISOR_INTERVAL_SECONDS`, `MT5_SUPERVISOR_MAX_STALE_SECONDS`
+**MCP bridge and logs**: `MCP_READ_TIMEOUT_SECONDS`, `MCP_SEND_TIMEOUT_SECONDS`, `MCP_AUTO_RECONNECT`, `MCP_RECONNECT_MAX_ATTEMPTS`, `MCP_RECONNECT_WINDOW_SECONDS`, `MCP_LOG_FILE`, `MCP_LOG_LEVEL`, `MCP_LOG_MAX_BYTES`, `MCP_LOG_BACKUPS`, `MCP_LOG_STDERR_LEVEL`
 **Debug**: Set `debug: True` in config dict
 
 ---
@@ -203,7 +211,7 @@ async def endpoint(request: Request, param: type = Body(...)):
 ## Testing & Debugging
 
 ```bash
-# Run tests (unit tests use a fake MT5 in tests/unit/fakes.py and never reach a terminal)
+# Run tests (unit tests use a fake MT5 in tests/unit/fakes.py and never reach a terminal; Python 3.10-3.13)
 pytest                                                  # Unit and route tests; integration tests are skipped
 MT5_RUN_INTEGRATION=1 pytest tests/metatrader_client/   # Integration: dedicated demo account only
 

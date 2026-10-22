@@ -1,8 +1,9 @@
 import MetaTrader5 as mt5
+from typing import Optional
 from .cancel_pending_order import cancel_pending_order
 from ._bulk import run_bulk
 
-def cancel_pending_orders_by_symbol(connection, symbol: str):
+def cancel_pending_orders_by_symbol(connection, symbol: str, *, scope: Optional[str] = None, strategy_id: Optional[str] = None, dry_run: bool = False):
     """
     Cancel all pending orders with the given symbol name.
 
@@ -12,6 +13,9 @@ def cancel_pending_orders_by_symbol(connection, symbol: str):
     Args:
         connection: The connection object to the MetaTrader platform.
         symbol: The symbol name of the orders to be canceled.
+        scope: 'strategy', 'manual' or 'all' (None: all items, as before).
+        strategy_id: Strategy whose items are processed with scope 'strategy'.
+        dry_run: Only list the affected items; nothing is sent.
 
     Returns:
         A dictionary with ``error`` (True if any item failed or remains),
@@ -25,4 +29,7 @@ def cancel_pending_orders_by_symbol(connection, symbol: str):
         verb="Canceled",
         noun=f"{symbol} pending orders",
         error=mt5.last_error,
+        scope=scope,
+        strategy_id=strategy_id,
+        dry_run=dry_run,
     )
