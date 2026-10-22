@@ -1,0 +1,19 @@
+[Unit]
+Description=Gold research - parse observed signals, no broker access
+After=trading-signal-hub.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading/gold-research
+Environment=GOLD_RESEARCH_HOME=%h/trading/gold-research
+Environment=FOREX_TRADER_DATA_DIR=%h/trading/gold-research/upstream-disabled
+Environment=REMOTE_ADMIN_CLIENT_ENABLED=false
+Environment=MT5_BRIDGE_ENABLED=false
+ExecStart=%h/trading/gold-research/.venv/bin/python -m gold_research processor
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -12,6 +12,8 @@ El [estudio completo de automatización](docs/AUTOMATION_IMPLEMENTATION_STUDY.md
 
 Primera pieza disponible: [Signal Hub 0.1](services/signal-hub/README.md), receptor Telegram Bot API independiente para Linux, con historial persistente y MCP de lectura. Opera únicamente en observación: no valida señales financieras, no envía órdenes y no implementa todavía el catálogo completo del estudio.
 
+Integración de investigación: [Gold Research MCP](services/gold-research/README.md) usa módulos de forex-gold para parsing, validación, análisis de OHLC y candidatos técnicos. Añade digest/acuse y búsqueda de señales, y herramientas de datos/riesgo/preflight para el adaptador demo Windows. La ejecución continúa por el MCP MT5 existente; la aplicación y el ejecutor de forex-gold no se arrancan. El componente de investigación declara su licencia AGPL separadamente.
+
 ## Pendientes conocidos tras fusionar el PR #1
 
 La revisión de la versión 0.6.0 reprodujo tres problemas adicionales, resueltos en el commit `cd2001c`. Se detallan con ubicaciones, pasos de reproducción simulada, impacto y criterios de aceptación en [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
