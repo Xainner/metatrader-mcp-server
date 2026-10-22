@@ -1,4 +1,4 @@
-"""Receiving only: getMe, getWebhookInfo and getUpdates. No send methods."""
+"""Receiving and access checks only. No send or membership-changing methods."""
 
 from contextlib import contextmanager
 import json
@@ -34,7 +34,7 @@ class TelegramAPI:
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def call(self, method: str, parameters: dict | None = None, timeout: int = 15):
-        if method not in {"getMe", "getWebhookInfo", "getUpdates"}:
+        if method not in {"getMe", "getWebhookInfo", "getUpdates", "getChat", "getChatMember"}:
             raise ApiError("METHOD_NOT_ALLOWED")
         request = urllib.request.Request(
             f"https://api.telegram.org/bot{self._token}/{method}",
@@ -69,6 +69,35 @@ def check_bot(config, api):
     if not isinstance(bot, dict) or type(bot.get("id")) is not int or bot.get("is_bot") is not True:
         raise ApiError("INVALID_BOT_IDENTITY")
     bind_bot(config, bot["id"])
+
+
+def check_chat_access(config, chat_ids, api=None):
+    """Read bot membership/visibility without polling, joining, or sending."""
+    if not chat_ids or any(type(chat) is not int or chat == 0 for chat in chat_ids):
+        raise ConfigurationError('Provide explicit nonzero Bot API chat IDs')
+    api = api or TelegramAPI(config.token)
+    bot = api.call('getMe')
+    if not isinstance(bot, dict) or bot.get('is_bot') is not True or type(bot.get('id')) is not int:
+        raise ApiError('INVALID_BOT_IDENTITY')
+    items = []
+    for chat_id in sorted(set(chat_ids)):
+        item = {'chat_id': chat_id, 'access_verified': False, 'can_receive_messages': False}
+        try:
+            chat = api.call('getChat', {'chat_id': chat_id})
+            if not isinstance(chat, dict) or chat.get('id') != chat_id:
+                raise ApiError('CHAT_IDENTITY_MISMATCH')
+            item.update(title=chat.get('title'), type=chat.get('type'))
+            member = api.call('getChatMember', {'chat_id': chat_id, 'user_id': bot['id']})
+            role = member.get('status') if isinstance(member, dict) else None
+            joined = role in ('creator', 'administrator', 'member') or (role == 'restricted' and member.get('is_member') is True)
+            visible = joined and (chat.get('type') == 'channel' or role in ('creator','administrator') or bot.get('can_read_all_group_messages') is True)
+            item.update(access_verified=True, bot_role=role, bot_member=joined, can_receive_messages=visible,
+                        blocker=None if visible else ('BOT_NOT_MEMBER' if not joined else 'GROUP_PRIVACY_MODE'))
+        except ApiError as exc:
+            item['blocker'] = exc.code
+        items.append(item)
+    return {'bot_username': bot.get('username'), 'chats': items, 'messages_sent': 0,
+            'updates_consumed': False, 'execution_authorized': False}
 
 
 @contextmanager

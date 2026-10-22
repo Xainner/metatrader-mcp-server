@@ -19,12 +19,21 @@ def main():
     commands.add_parser("poll")
     commands.add_parser("mcp")
     commands.add_parser("discover-chats")
+    access = commands.add_parser("check-chats")
+    access.add_argument("--chat-id", type=int, action="append", required=True)
     events = commands.add_parser("events")
     events.add_argument("--after", type=int, default=0)
     events.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
     try:
         config = load_config(args.home)
+        if args.command == 'check-chats':
+            from .telegram import ApiError, check_chat_access
+            try:
+                print(json.dumps(check_chat_access(config, args.chat_id), ensure_ascii=False, indent=2))
+                return
+            except ApiError as exc:
+                raise ConfigurationError(exc.code) from None
         if args.command == "poll":
             from .telegram import poll
             poll(config.home)
