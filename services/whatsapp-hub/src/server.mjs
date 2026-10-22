@@ -17,11 +17,11 @@ for (const name of ['SingletonLock','SingletonCookie','SingletonSocket']) {
   catch (error) { if (error.code!=='ENOENT') throw error; }
 }
 const store = new Store(path.join(home, 'data/signals.sqlite3'), initial.source_id);
-let state = 'starting', qr = null, qrAt = 0, client = null, groups = [], lastError = null;
-const status = () => ({state, source_id:initial.source_id, enabled:readConfig().enabled,
+let state = 'starting', qr = null, qrAt = 0, client = null, groups = [], lastError = null, authenticated = false, mainReady = false;
+const status = () => ({state:!authenticated && qr ? 'awaiting_qr' : state, source_id:initial.source_id, enabled:readConfig().enabled,
   authorized_groups:readConfig().allowed_group_ids.length, stored_events:store.count(),
   qr_available:!!qr && Date.now()-qrAt < 45000, last_error:lastError,
-  qr_version:qrAt, receiver_ready:!!client,
+  qr_version:qrAt, authenticated, receiver_ready:authenticated && mainReady,
   execution_authorized:false, as_of:new Date().toISOString()});
 const fail = code => { lastError=code; console.error(code); };
 setInterval(() => {
@@ -69,7 +69,7 @@ const { defaultLogger, create } = await import('@wppconnect-team/wppconnect');
 defaultLogger.transports.forEach(transport => { transport.silent = true; });
 try {
   client = await create({session:'rinari-signals', deviceName:'Rinari Signal Receiver',
-    headless:true, useChrome:false, logQR:false, autoClose:0,
+    headless:true, useChrome:false, logQR:false, autoClose:0, waitForLogin:true,
     disableWelcome:true, updatesLog:false, disableGoogleAnalytics:true,
     folderNameToken:path.join(home,'tokens'),
     puppeteerOptions:{executablePath:'/usr/bin/chromium', userDataDir:path.join(home,'browser'),
@@ -77,7 +77,9 @@ try {
     catchQR(base64) { qr = Buffer.from(base64.replace(/^data:image\/png;base64,/,''),'base64'); qrAt=Date.now(); state='awaiting_qr'; },
     statusFind(value) { state=String(value).replace(/[^a-zA-Z0-9_-]/g,'').slice(0,80); }
   });
-  qr=null; state='connected';
+  authenticated=await client.isAuthenticated(); mainReady=await client.isMainReady();
+  if (authenticated) qr=null;
+  state=authenticated && mainReady ? 'connected' : 'awaiting_login';
   client.onMessage(msg => record(msg));
   client.onMessageEdit(data => record({...data.msg, id:data.id, chatId:wid(data.chat)}, 'edit'));
   client.onRevokedMessage(data => {
@@ -87,14 +89,19 @@ try {
   });
   client.onStateChange(value => { state=String(value).replace(/[^a-zA-Z0-9_-]/g,'').slice(0,80); });
   const refreshGroups = async () => {
-    try { groups=(await client.getAllGroups(false)).map(g=>({id:wid(g.id), name:g.name || g.formattedTitle || '',
+    try { groups=(await client.listChats({onlyGroups:true,count:1000})).map(g=>({id:wid(g.id), name:g.name || g.formattedTitle || '',
       community:!!g.groupMetadata?.isParentGroup, announcements:!!g.groupMetadata?.isDefaultSubgroup})); }
     catch { fail('GROUP_DISCOVERY_FAILED'); }
   };
   await refreshGroups(); setInterval(refreshGroups,60000);
   let missed=0;
   setInterval(async()=>{
-    try { if (await client.isConnected()) { missed=0; } else { state='disconnected'; if (++missed>=3) process.exit(1); } }
+    try {
+      authenticated=await client.isAuthenticated(); mainReady=await client.isMainReady();
+      if (authenticated && mainReady && await client.isConnected()) { missed=0; qr=null; state='connected'; }
+      else if (authenticated) { state='disconnected'; if (++missed>=3) process.exit(1); }
+      else state='awaiting_login';
+    }
     catch { state='connection_unknown'; if (++missed>=3) process.exit(1); }
   },30000);
 } catch { state='failed'; fail('WHATSAPP_START_FAILED'); setTimeout(()=>process.exit(1),30000); }
