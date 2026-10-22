@@ -8,6 +8,14 @@ const home = process.env.WHATSAPP_HOME || '/data';
 fs.mkdirSync(path.join(home, 'data'), {recursive:true, mode:0o700});
 const readConfig = () => validateConfig(JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8')));
 const initial = readConfig();
+// Entrypoint holds a host filesystem flock for this runtime. A killed Chromium
+// container can leave hostname/PID symlinks that block every subsequent start.
+// Remove only these ephemeral symlinks; never cookies, tokens or profile data.
+for (const name of ['SingletonLock','SingletonCookie','SingletonSocket']) {
+  const lock=path.join(home,'browser',name);
+  try { if (fs.lstatSync(lock).isSymbolicLink()) fs.unlinkSync(lock); else throw Error('Unexpected profile lock file'); }
+  catch (error) { if (error.code!=='ENOENT') throw error; }
+}
 const store = new Store(path.join(home, 'data/signals.sqlite3'), initial.source_id);
 let state = 'starting', qr = null, qrAt = 0, client = null, groups = [], lastError = null;
 const status = () => ({state, source_id:initial.source_id, enabled:readConfig().enabled,
@@ -27,6 +35,10 @@ const record = (msg, kind='new') => {
   try { store.receive(msg, readConfig(), kind); }
   catch { fail('RECEIVER_STORAGE_OR_CONFIG_ERROR'); process.exit(1); }
 };
+for (const name of ['SIGTERM','SIGINT']) process.on(name,async()=>{
+  qr=null; state='stopping'; setTimeout(()=>process.exit(0),5000).unref();
+  await client?.close(); store.db.close(); process.exit(0);
+});
 
 // Only read endpoints. The Docker port is published exclusively on host loopback.
 http.createServer(async (req,res) => {
@@ -86,4 +98,3 @@ try {
     catch { state='connection_unknown'; if (++missed>=3) process.exit(1); }
   },30000);
 } catch { state='failed'; fail('WHATSAPP_START_FAILED'); setTimeout(()=>process.exit(1),30000); }
-for (const name of ['SIGTERM','SIGINT']) process.on(name,async()=>{qr=null;await client?.close();store.db.close();process.exit(0);});
